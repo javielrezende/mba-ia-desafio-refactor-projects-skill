@@ -763,3 +763,248 @@ Na mesma linha de legibilidade: `is_overdue()` (`models/task.py:50-59`), `is_adm
 | 3 | MEDIUM | Regra de "atrasada" duplicada 6× e validação 3×, com `models`/`utils`/`services` existindo mas nunca chamados | `routes/*.py`, `utils/helpers.py` |
 | 4 | LOW | Magic numbers de prioridade, título, senha e status — com as constantes já definidas e ignoradas | `utils/helpers.py`, `routes/task_routes.py` |
 | 5 | LOW | `print()` como log, `except:` nu sem registro de erro, imports mortos e `utcnow()` deprecado | `routes/*.py`, `utils/helpers.py` |
+
+---
+
+## Construção da Skill
+
+A skill vive em `.claude/skills/refactor-arch/` e é composta por um `SKILL.md` (o prompt que orquestra) e cinco arquivos de referência em `references/` (o conhecimento de domínio). A pasta é idêntica nos três projetos — é a mesma cópia, sem nenhum ajuste local.
+
+```
+.claude/skills/refactor-arch/
+├── SKILL.md                              # orquestração das 3 fases + regras invioláveis
+└── references/
+    ├── project-analysis.md               # Fase 1 — heurísticas de detecção
+    ├── antipattern-catalog.md            # Fase 2 — 19 anti-patterns com sinais de detecção
+    ├── report-template.md                # Fase 2 — formato do relatório
+    ├── architecture-guidelines.md        # Fase 3 — MVC alvo e estrutura por stack
+    └── refactoring-playbook.md           # Fase 3 — 16 transformações antes/depois
+```
+
+### Decisões de design
+
+**1. `SKILL.md` orquestra, os `references/` sabem.**
+O `SKILL.md` tem 94 linhas e quase nenhum conhecimento técnico: ele diz *o que fazer, em que ordem e o que é proibido*. Todo o conteúdo — os greps de detecção, a tabela de severidades, os exemplos de código — está nos arquivos de referência, carregados **sob demanda, na fase correspondente**. Uma tabela no topo do `SKILL.md` diz qual arquivo ler em qual fase, com instrução explícita de não ler todos de uma vez. O motivo é prático: os cinco arquivos somam ~1.550 linhas, e carregar tudo de largada gastaria contexto com o playbook de refatoração antes mesmo de saber se o usuário vai aprovar a Fase 3.
+
+**2. Cinco regras invioláveis no topo do `SKILL.md`.**
+São restrições que, se violadas, invalidam a entrega inteira — por isso ficam antes da descrição das fases, não diluídas no meio dela:
+
+| Regra | Por quê |
+|---|---|
+| Nenhuma escrita antes do `y` | O portão humano é requisito do desafio. Nas Fases 1 e 2 só são permitidas ferramentas de leitura — inclusive salvar o relatório em `reports/` só acontece depois da aprovação. |
+| Todo finding tem arquivo e linha reais | É o item do checklist mais fácil de falhar por alucinação. A regra manda descartar o achado que não foi localizado fisicamente. |
+| Nada de suposição de stack | Vale o manifesto e os imports, não o nome da pasta — ver o problema do `ecommerce-api-legacy` abaixo. |
+| Comportamento preservado | A Fase 3 não pode mudar contrato de API. As únicas exceções são correções de segurança, e cada uma precisa ser listada como *breaking change*. |
+| Contagens vêm de comando executado | `Files: 4 analyzed` e `Total: 14 findings` saem de `wc -l`/`find` e da soma conferida, não de estimativa. |
+
+**3. Fase 2 com resposta ambígua = `n`.**
+O `SKILL.md` manda tratar silêncio ou resposta não-inequívoca como recusa, oferecendo salvar apenas o relatório. É o comportamento seguro quando o próximo passo reescreve o projeto inteiro.
+
+**4. A Fase 3 captura uma linha de base antes de tocar em qualquer arquivo.**
+Antes da primeira escrita, a skill sobe a aplicação original e registra status e forma de resposta de cada endpoint. Sem esse registro, "os endpoints continuam respondendo" é uma afirmação não verificável — e o checklist do desafio pede exatamente essa verificação. A instrução é explícita: nunca declarar validação verde sem ter executado o boot e as chamadas.
+
+**5. Migração em ordem de dependência, validando por grupo.**
+A Fase 3 migra `config/` → `models/` → `services/` → `controllers/` → `routes/` → `middlewares/` → composition root, e o playbook fecha com uma ordem recomendada de aplicação dos 16 padrões (segredos primeiro, limpeza por último). Validar a cada grupo, e não só no fim, torna uma quebra atribuível ao passo que a causou.
+
+### Quais anti-patterns entraram e por quê
+
+O mínimo exigido era 8; o catálogo tem **19**, com severidade distribuída. A quantidade não é enfeite: cada um foi incluído porque corresponde a um achado real da análise manual acima, e a numeração (`AP-01`…`AP-19`) permite que o playbook referencie a correção sem repetir a explicação.
+
+| ID | Severidade | Anti-pattern | Origem na análise manual |
+|---|---|---|---|
+| AP-01 | CRITICAL | SQL Injection por concatenação | Projeto 1, achado 1 (~15 ocorrências em `models.py`) |
+| AP-02 | CRITICAL | Credenciais e segredos hardcoded | Projetos 1, 2 e 3 — `SECRET_KEY`, `pk_live_*`, SMTP |
+| AP-03 | CRITICAL | God Class / God Module | Projeto 2, achado 1 (`AppManager.js`) |
+| AP-04 | CRITICAL | Autenticação quebrada / hashing fraco | Projeto 3, achado 1 (MD5 sem salt); `badCrypto` do projeto 2 |
+| AP-05 | CRITICAL | Exposição de dado sensível | Senha no JSON (proj. 3), cartão em log (proj. 2), `/admin/query` (proj. 1) |
+| AP-06 | HIGH | Regra de negócio dentro do handler | Projeto 3, achado 3 — a violação central de MVC |
+| AP-07 | HIGH | Acoplamento forte, sem injeção de dependência | Projeto 2 — `new sqlite3.Database` no construtor |
+| AP-08 | HIGH | Estado global mutável | Projeto 2 — `globalCache`, `totalRevenue` |
+| AP-09 | HIGH | Escrita multi-passo sem transação | Projeto 2, achado 3 — checkout com 4 `INSERT` |
+| AP-10 | HIGH | Erro engolido, ignorado ou espalhado | Projeto 3 — `except:` nu em 11 lugares; `err` ignorado no proj. 2 |
+| AP-11 | MEDIUM | Query N+1 | Achado presente nos **três** projetos |
+| AP-12 | MEDIUM | Listagem sem paginação | Três projetos — nenhum endpoint tem `LIMIT` |
+| AP-13 | MEDIUM | Duplicação de regra e validação | Projetos 1 e 3 — regra de "atrasada" copiada 6× |
+| AP-14 | MEDIUM | Validação ausente ou superficial na rota | Projeto 2 — só checagem de presença |
+| AP-15 | MEDIUM | **APIs deprecated** (checagem obrigatória) | Projeto 3 — `utcnow()`, `Model.query.get()` |
+| AP-16 | LOW | Magic numbers | Projetos 1 e 3 — faixas de desconto, `priority <= 2` |
+| AP-17 | LOW | `print`/`console.log` como log | Três projetos |
+| AP-18 | LOW | Nomenclatura ruim | Projeto 2 — `u`, `e`, `p`, `usr`, `eml`, `c_id` |
+| AP-19 | LOW | Código e camadas mortas | Projeto 3 — `services/` que ninguém importa |
+
+Três escolhas dentro do catálogo merecem justificativa:
+
+- **AP-15 é a única checagem marcada como obrigatória.** O desafio exige detecção de APIs deprecated, e é o tipo de coisa que um auditor pula quando não encontra nada. A regra é que a linha `Deprecated APIs:` apareça no relatório **sempre**, inclusive como `nenhuma ocorrência encontrada` — assim o item do checklist é auditável nos dois casos. A tabela cobre 17 APIs de Python, Flask, SQLAlchemy 2.0, Node, Express 5, Sequelize e JavaScript.
+- **Regras de promoção de severidade, em vez de severidade fixa por ID.** Um `console.log` é AP-17 (LOW); um `console.log` imprimindo número de cartão é AP-05 (CRITICAL). O catálogo tem uma regra explícita: exposição de dado sensível sobe para CRITICAL, e um achado sobe de nível se tornar o código impossível de testar em isolamento. Sem isso, o `AppManager.js:45` do projeto 2 seria classificado como um problema de legibilidade.
+- **Agrupamento por raiz.** Quinze `print()` viram **um** finding com sub-itens. A regra existe porque a alternativa — inflar a contagem com ocorrências repetidas — atinge o mínimo de 5 findings sem auditar nada.
+
+O `AP-19` (código morto) e o `AP-06` (regra no handler) são os que justificam a existência do terceiro projeto: são os únicos que aparecem em codebases já organizadas por pasta.
+
+### Como a skill ficou agnóstica de tecnologia
+
+Cinco mecanismos concretos, não só a intenção:
+
+**a) Detecção por precedência, não por convenção de nome.**
+A regra é *manifesto de dependências > imports no código > extensão de arquivo*. O `project-analysis.md` traz uma tabela de 9 manifestos (`requirements.txt`, `package.json`, `composer.json`, `go.mod`, `pom.xml`, `Gemfile`, `Cargo.toml`, `*.csproj`, `pyproject.toml`) e exige que o framework seja **confirmado por import** — o manifesto dá a versão, o código prova o uso.
+
+**b) Anti-patterns definidos por conceito, com sinais traduzíveis.**
+Cada AP é descrito de forma independente de linguagem, e os greps são exemplos em Python e JavaScript porque são as stacks dos alvos. O catálogo diz explicitamente: *"traduza o sinal para a stack detectada — o equivalente de `print()` em PHP é `echo`/`var_dump`, em Go é `fmt.Println`"*. O que é detectado é "log sem nível nem destino configurável", não `print(`.
+
+**c) Estrutura de diretórios por stack, com instrução de seguir a convenção do framework.**
+O `architecture-guidelines.md` define os *papéis* das camadas de forma abstrata (com a regra da seta única e uma lista de "o que esta camada NUNCA faz") e depois dá a árvore concreta para Flask e para Express, mais o mapeamento para Laravel, Spring e Django. A instrução é literal: *"não force nomes Flask em um projeto Express"*.
+
+**d) Playbook com o mesmo padrão nas duas linguagens.**
+Os 16 padrões mostram antes/depois em Python **e** JavaScript sempre que a diferença importa — RP-08 (N+1), por exemplo, traz a versão SQL cru com `JOIN`, a versão ORM com `joinedload`, a agregação com `GROUP BY` e a conversão do inferno de callbacks do Node para uma query única. O texto abre dizendo que os exemplos são ilustrativos e o que se aplica é o padrão.
+
+**e) Zero acoplamento textual aos projetos-alvo.**
+Nenhum arquivo de referência cita `models.py`, `AppManager.js` ou `task_routes.py`. Os sinais foram *calibrados* contra os problemas reais encontrados na análise manual, mas escritos de forma genérica — é o que permite copiar a pasta entre os três projetos sem editar uma linha (e o `diff -r` entre as três cópias é vazio).
+
+**f) Adaptação quando não há framework web.**
+O `project-analysis.md` prevê o caso: se nenhum framework for detectado, a Fase 1 registra `Framework: nenhum (script/CLI)` e a Fase 3 adapta o MVC alvo — a camada View passa a ser a interface de entrada (CLI, worker, consumer).
+
+### Desafios encontrados
+
+**1. O projeto "organizado" é o mais difícil de auditar.**
+O `task-manager-api` já tem `models/`, `routes/`, `services/` e `utils/` — e é justamente onde uma auditoria rasa conclui "está tudo certo" e devolve menos de 5 findings, furando o critério de aceite. A separação ali é só de pastas: a regra de negócio mora no handler, `Task.is_overdue()` existe e nunca é chamado, e `services/notification_service.py` não é importado por arquivo nenhum. A solução foi dupla: o catálogo termina com um checklist de varredura que avisa que projetos organizados concentram os achados em **AP-06, AP-10, AP-11, AP-13 e AP-19**, e o `SKILL.md` instrui, no passo 2 da Fase 2, a não pular categorias porque o projeto "parece organizado". O `project-analysis.md` ainda dá o grep que prova camada morta: um módulo em `services/` que nenhum arquivo importa.
+
+**2. Distinguir anti-pattern de falso-positivo.**
+`execute("SELECT ... WHERE id = ?", (id,))` e `execute("SELECT ... WHERE id = " + str(id))` são graficamente parecidos e completamente diferentes. Cada anti-pattern propenso a isso ganhou uma seção de falso-positivo — em AP-01, a regra é que o que importa é o valor entrar pelo parâmetro, não pela string. O caso mais sutil é o `ORDER BY` dinâmico, que **não pode** ser parametrizado: o RP-01 mostra a correção por allowlist, para a skill não "consertar" com um placeholder que quebraria a query.
+
+**3. Nome de pasta mentindo sobre o domínio.**
+O diretório se chama `ecommerce-api-legacy` e o projeto é um LMS (cursos, matrículas, pagamentos). Se a Fase 1 inferir domínio pelo nome da pasta, todo o resto da auditoria herda o erro. Daí a regra 3 do `SKILL.md` e a instrução de cruzar três evidências — rotas, tabelas e `api.http`/README — com um aviso explícito sobre nomes enganosos.
+
+**4. Refatorar sem quebrar o contrato da API.**
+Vários anti-patterns só se corrigem mudando a interface pública: `usr`/`eml`/`c_id` são nomes ruins **e** são o payload que o consumidor envia; introduzir paginação muda uma resposta que hoje é um array puro. A skill separa os dois casos. Mudança de nomenclatura em payload público: aceitar os dois nomes por um período (`req.body.userName ?? req.body.usr`). Paginação: se o contrato original devolvia array, manter o array e enviar os metadados em headers (`X-Total-Count`). E as correções de segurança que **precisam** quebrar — remover o campo `senha` da resposta, remover o `POST /admin/query` — são permitidas, mas obrigadas a aparecer numa seção de *breaking changes* no fim da Fase 3.
+
+**5. Impedir validação declarada sem execução.**
+"✓ Application boots without errors" é uma linha barata de imprimir. A contramedida ficou em três pontos: a linha de base capturada antes da refatoração, a exigência de colar a **saída real** do boot e das chamadas no relatório (não parafrasear), e uma lista de "erros que invalidam o relatório" no `report-template.md`, onde consta marcar validação como ✅ sem ter executado boot e chamadas.
+
+**6. Contagem inflada como atalho para o critério de aceite.**
+Os critérios pedem ≥ 5 findings, o que cria um incentivo ruim: reportar cinco ocorrências do mesmo `print()`. Além da regra de agrupamento por raiz, o passo 8 da Fase 2 diz o que fazer quando o resultado ficou abaixo do mínimo — *não inventar achados*, e sim revisar as categorias marcadas como ausentes, porque uma varredura rasa é a causa muito mais provável que um projeto limpo.
+
+---
+
+## Resultados
+
+> _Seção a ser preenchida após a execução da skill nos três projetos: resumo dos relatórios de `reports/`, comparação antes/depois, checklist de validação preenchido e os logs das aplicações rodando após a refatoração._
+
+---
+
+## Como Executar
+
+### Pré-requisitos
+
+| Requisito | Versão | Usado por |
+|---|---|---|
+| [Claude Code](https://docs.claude.com/en/docs/claude-code) | atual | os três projetos (é a ferramenta que executa a skill) |
+| Python | 3.10+ | `code-smells-project`, `task-manager-api` |
+| Node.js | 18+ | `ecommerce-api-legacy` |
+| `curl` | qualquer | validação manual dos endpoints |
+
+A skill não instala dependências: instale as de cada projeto antes de rodar a Fase 3, senão a validação de boot falha.
+
+### A skill já está nos três projetos
+
+`.claude/skills/refactor-arch/` está versionada dentro de `code-smells-project/`, `ecommerce-api-legacy/` e `task-manager-api/` — as três cópias são idênticas. Não é preciso copiar nada. Se quiser conferir:
+
+```bash
+diff -r code-smells-project/.claude/skills/refactor-arch \
+        task-manager-api/.claude/skills/refactor-arch     # sem saída = idênticas
+```
+
+Skills de projeto são descobertas a partir do diretório onde o Claude Code é aberto — por isso o `cd` em cada projeto é parte do procedimento, não conveniência.
+
+### Projeto 1 — code-smells-project (Python/Flask)
+
+```bash
+cd code-smells-project
+pip install -r requirements.txt
+claude "/refactor-arch"
+```
+
+Esperado: Fase 1 detecta `Python` + `Flask 3.1.1`, domínio de e-commerce e 4 arquivos-fonte. Fase 2 emite o relatório e **pausa** em `Proceed with refactoring (Phase 3)? [y/n]`. Responda `y` para liberar a refatoração.
+
+### Projeto 2 — ecommerce-api-legacy (Node.js/Express)
+
+```bash
+cd ../ecommerce-api-legacy
+npm install
+claude "/refactor-arch"
+```
+
+Esperado: Fase 1 detecta `JavaScript` + `Express ^4.18.2` e o domínio de **LMS com checkout** (cursos, matrículas, pagamentos) — não "e-commerce", apesar do nome da pasta.
+
+### Projeto 3 — task-manager-api (Python/Flask)
+
+```bash
+cd ../task-manager-api
+pip install -r requirements.txt
+python seed.py
+claude "/refactor-arch"
+```
+
+Esperado: Fase 1 detecta `Python` + `Flask 3.0.0` com SQLAlchemy e o domínio de Task Manager. Fase 2 deve encontrar problemas **mesmo com o projeto já dividido em pastas** — a concentração esperada está em regra de negócio no handler, `except:` nu, N+1, duplicação e camada morta.
+
+> Rode o `seed.py` **antes** do primeiro boot: sem ele o banco fica vazio e a validação de endpoints da Fase 3 não distingue "lista vazia" de "quebrou".
+
+### Como validar que a refatoração funcionou
+
+**1. A aplicação sobe.**
+
+```bash
+# Python
+python app.py            # esperado: servidor em http://localhost:5000, sem traceback
+
+# Node
+npm start                # esperado: servidor em http://localhost:3000, sem stack trace
+```
+
+**2. Os endpoints originais respondem igual.**
+
+```bash
+# code-smells-project
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:5000/produtos
+curl -s http://localhost:5000/produtos/1
+curl -s http://localhost:5000/pedidos
+
+# ecommerce-api-legacy — payloads prontos em api.http
+curl -s -X POST http://localhost:3000/api/checkout \
+  -H 'Content-Type: application/json' \
+  -d '{"usr":"Guilherme","eml":"gui@fullcycle.com.br","pwd":"senhaforte","c_id":2,"card":"4111222233334444"}'
+curl -s http://localhost:3000/api/admin/financial-report
+
+# task-manager-api
+curl -s http://localhost:5000/tasks
+curl -s http://localhost:5000/reports/summary
+```
+
+Compare **status** e **forma da resposta** (as chaves do JSON) com o comportamento anterior à refatoração. Valores voláteis — ids autoincrementais, timestamps — não contam como diferença.
+
+**3. A estrutura MVC existe.**
+
+```bash
+tree src -L 2      # esperado: config/ models/ services/ controllers/ views|routes/ middlewares/
+```
+
+**4. Os anti-patterns sumiram.**
+
+```bash
+# nenhum segredo literal restante
+grep -rniE "(secret|password|api[_-]?key)\s*[:=]\s*['\"]" src/
+
+# nenhuma query por concatenação
+grep -rnE "(execute|query|run)\(.*(\+|\$\{|f\")" src/
+
+# nenhum except nu / console.log de log
+grep -rn "except:" src/ ; grep -rn "console\.log(" src/
+```
+
+Saída vazia nos quatro comandos é o resultado esperado.
+
+**5. O relatório foi salvo.**
+
+```bash
+ls reports/        # audit-project-1.md, audit-project-2.md, audit-project-3.md
+```
+
+Cada relatório deve trazer a seção "Resultado da Refatoração" com o log real do boot e das chamadas — não uma descrição do log.
