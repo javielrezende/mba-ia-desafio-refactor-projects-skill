@@ -94,6 +94,16 @@ grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "fake.?(jwt|to
 ```
 Sinais: MD5/SHA1 como hash de senha (com ou sem salt), senha em texto puro no banco, comparação direta `user.password == pwd`, "criptografia" caseira (loop de base64, XOR, `substring`), token previsível (`'fake-jwt-token-' + user.id`), senha default silenciosa quando o campo vem vazio (`badCrypto(p || "123456")`).
 
+**Enumeração de contas no login** — leia o handler de login inteiro, o grep só localiza:
+
+```bash
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "def login|/login|login\(" -A 14 . | grep -nE "if not user|if \(!user|first\(\)"
+```
+
+O sinal é **estrutural, não textual**: o handler retorna 401 assim que não encontra o e-mail, *antes* de executar a verificação de senha. Mesmo com a mensagem de erro idêntica nos dois casos (`'Credenciais inválidas'`), o caminho do e-mail inexistente pula o cálculo do hash e responde mensurável­mente mais rápido — dá para enumerar contas válidas pelo tempo de resposta.
+
+Não confunda com o problema de mensagem distinta (`'Usuário não encontrado'` vs `'Senha incorreta'`), que é o caso óbvio: se as mensagens **já** são uniformes, isso está certo e não deve ser "corrigido" — o que falta é igualar o trabalho executado nos dois caminhos (comparar contra um hash dummy quando o usuário não existe). Correção em RP-04.
+
 **Por que CRITICAL:** MD5 sem salt cai por rainbow table em segundos e senhas iguais geram hashes iguais. Um token sem assinatura e sem expiração dá falsa impressão de autenticação onde não há nenhuma. Verifique também se existe alguma verificação de autorização: um método `is_admin()` definido e **nunca chamado** significa zero controle de acesso.
 
 → Correção: **RP-04**
@@ -187,8 +197,17 @@ grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "except:" --incl
 grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "except Exception( as e)?:\s*(pass|$)" --include='*.py' .
 grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "\(err[,)]" --include='*.js' . | wc -l   # compare com o nº de checagens de err
 grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "errorhandler|app\.use\(\(err|middleware.*error" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(let|var|const) [a-zA-Z]*([Pp]ending|[Rr]emaining|[Cc]ounter) *=" --include='*.js' .   # contador manual de concorrência
 ```
 Sinais: `except:` nu (captura até `KeyboardInterrupt`/`SystemExit`); `catch` vazio; callback que recebe `err` e nunca o checa (`(err) => { res.send("ok") }`); `try/except` repetido em cada handler devolvendo `{'error': 'Erro interno'}, 500` **sem registrar stack trace**; nenhum `@app.errorhandler` / `app.use((err, req, res, next))` registrado.
+
+**Contador manual de concorrência** (`let coursesPending = courses.length` decrementado dentro de `forEach`, respondendo quando chega a zero) é sinal de três defeitos de uma vez, e cada um deve entrar como sub-item do finding:
+
+1. **Ordem não determinística** — o `push` no array de resposta acontece na ordem de conclusão das queries, não na ordem da lista de origem. O mesmo request devolve o resultado em ordens diferentes a cada chamada, sem nenhum `ORDER BY` para garantir estabilidade.
+2. **Erros ignorados** — os callbacks internos recebem `err` e não o checam; a falha vira `undefined` e é serializada como valor válido (`'Unknown'`).
+3. **Queda do processo** — `rows.length` de um `undefined` dentro de callback assíncrono lança `TypeError` fora de qualquer `try/catch` alcançável, derrubando o Node inteiro.
+
+O contador existe porque a API é por callback; a correção é migrar para `Promise`/`async-await` (RP-14) e, quando for varredura de relacionamento, colapsar tudo em uma query com `JOIN` (RP-08) — aí o contador desaparece junto com a race condition.
 
 **Por que HIGH:** o erro desaparece — sem stack trace no log e sem detalhe na resposta, o bug fica invisível em produção. Além disso, `err` ignorado em callback assíncrono vira `undefined` mais adiante e derruba o processo Node inteiro (`enrollments.length` de um `undefined`), fora de qualquer `try/catch`.
 
@@ -247,7 +266,12 @@ Sinais: o mesmo bloco de validação copiado entre `create` e `update`; a mesma 
 ```bash
 grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "req\.body\.|request\.get_json\(\)|request\.json" -A 6 . | grep -viE "if not|schema|validate|marshmallow|joi|zod"
 ```
+```bash
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "len\((password|senha|pwd)[^)]*\) *< *[0-9]|\.length *< *[0-9]|MIN_PASSWORD_LENGTH *= *[0-9]" .   # política de senha
+```
 Sinais: leitura direta de `req.body.x` sem checar tipo nem formato; validação só de presença (`if (!u || !e)`) sem validar formato de e-mail, faixa numérica ou tipo; nenhum middleware de validação registrado; nenhuma biblioteca de schema (marshmallow, pydantic, joi, zod) usada apesar de declarada no manifesto.
+
+**Política de senha fraca** é sub-item deste anti-pattern: mínimo abaixo de 8 caracteres (`if len(password) < 4`), ausência de qualquer mínimo, ou senha default preenchida pelo servidor quando o campo vem vazio (esta última sobe para AP-04, porque cria conta acessível sem o usuário saber). Um mínimo de 4 caracteres reduz o espaço de busca a ponto de tornar o *brute force* trivial, independentemente do algoritmo de hash — e costuma vir acompanhado da constante correta já definida e ignorada (`MIN_PASSWORD_LENGTH` em um módulo de helpers que ninguém importa), o que liga este achado ao AP-16 e ao AP-19.
 
 **Por que MEDIUM:** um campo com tipo inesperado quebra a aplicação — `cc.startsWith(...)` lança `TypeError` se `card` vier como número, e em callback assíncrono isso derruba o processo. Validação espalhada por handler também é a origem do AP-13.
 
@@ -258,7 +282,7 @@ Sinais: leitura direta de `req.body.x` sem checar tipo nem formato; validação 
 **Detecção** — rode a varredura completa abaixo e reporte cada ocorrência com a substituta:
 
 ```bash
-grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "utcnow\(\)|datetime\.utcfromtimestamp|Query\.get\(|query\.get\(|before_first_request" --include='*.py' .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "utcnow\(\)|datetime\.utcfromtimestamp|Query\.get\(|query\.get\(|before_first_request|type\([^)]*\) *==" --include='*.py' .
 grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "new Buffer\(|url\.parse\(|\.substr\(|createCipher\(|require\('request'\)|util\.isArray" --include='*.js' .
 ```
 
@@ -267,6 +291,7 @@ grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "new Buffer\(|u
 | Python 3.12+ | `datetime.utcnow()`, `datetime.utcfromtimestamp()` | `datetime.now(timezone.utc)` |
 | Python 3.12+ | `imp`, `distutils` | `importlib`, `setuptools`/`packaging` |
 | Python | `assertEquals`, `@asyncio.coroutine` | `assertEqual`, `async def` |
+| Python | `type(x) == list` | `isinstance(x, list)` — não é depreciação formal, mas é idioma obsoleto: falha com subclasses e é o que `isinstance` existe para resolver |
 | Flask 2.3+ | `@app.before_first_request` | inicialização no application factory |
 | Flask | `flask.json.JSONEncoder`, `app.json_encoder` | `app.json_provider_class` |
 | SQLAlchemy 2.0 | `Model.query.get(id)` | `db.session.get(Model, id)` |
@@ -336,12 +361,22 @@ Sinais: variáveis de uma letra em função longa (`u`, `e`, `p`, `cc`); abrevia
 ```bash
 # import declarado e símbolo nunca referenciado
 grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "^import \|^from .* import " --include='*.py' .
-# módulo que ninguém importa
-for f in $(find . -name '*.py' -path '*/services/*' -o -name '*.js' -path '*/utils/*'); do
-  b=$(basename "$f" | sed 's/\..*//'); echo "$b: $(grep -rl --exclude-dir={.claude,node_modules,.venv,__pycache__} "$b" --include='*.py' --include='*.js' . | grep -v "$f" | wc -l)"
+# módulo que ninguém importa — cobre services/ e utils/ nas duas linguagens
+for f in $(find . \( -path '*/services/*' -o -path '*/utils/*' -o -path '*/helpers/*' -o -path '*/lib/*' \) \
+                  \( -name '*.py' -o -name '*.js' \) \
+                  -not -path './.claude/*' -not -path './node_modules/*' -not -name '__init__.py'); do
+  b=$(basename "$f" | sed 's/\..*//')
+  echo "$b: $(grep -rl --exclude-dir={.claude,node_modules,.venv,__pycache__} "$b" --include='*.py' --include='*.js' . | grep -v "$f" | wc -l) importador(es)"
 done
 ```
 Sinais: `import os, sys, json` sem nenhum uso; função utilitária definida e nunca chamada; **módulo inteiro que nenhum arquivo importa** (um `notification_service.py` pronto que a API nunca aciona — a funcionalidade de notificação simplesmente não existe); export de símbolo que ninguém consome; variável importada e não usada.
+
+**Como ler a contagem do laço acima:**
+
+| Resultado | Leitura |
+|---|---|
+| `0 importador(es)` | camada morta confirmada — o módulo inteiro está desligado do fluxo |
+| `1+ importador(es)` | **não conclua que está vivo.** O caso mais comum em projeto "organizado" é o import existir no topo do arquivo e a função nunca ser chamada. Confirme com `grep -n "<nome_da_função>("` nos importadores: se só aparece na linha do `import`, é morto do mesmo jeito |
 
 **Por que importa:** a pasta sugere uma arquitetura que o código não pratica, e o leitor seguinte acredita que a funcionalidade existe.
 
