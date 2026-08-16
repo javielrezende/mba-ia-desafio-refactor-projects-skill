@@ -543,3 +543,108 @@ Na mesma linha de legibilidade: o parâmetro `id` (`controllers.py:14`, `models.
 | 3 | MEDIUM | Validação duplicada (e já divergente) entre `criar`/`atualizar` + serialização repetida 3× | `controllers.py`, `models.py` |
 | 4 | LOW | Magic numbers nas faixas de desconto | `models.py` |
 | 5 | LOW | `print()` como log, concatenação manual de strings, dado sensível em log | `controllers.py`, `app.py` |
+
+---
+
+### Projeto 2 — `ecommerce-api-legacy/` (Node.js/Express — LMS API com checkout)
+
+**Estrutura atual:** 3 arquivos em `src/` — `app.js` (14 linhas, só sobe o servidor), `AppManager.js` (141 linhas, a aplicação inteira) e `utils.js` (25 linhas, configuração + cache global + "criptografia"). Não existe camada de model, controller ou service: o `AppManager` é ao mesmo tempo o roteador, o repositório e a regra de negócio.
+
+---
+
+#### 1. [CRITICAL] God Class `AppManager` com credenciais hardcoded e dados de cartão em log
+
+**Onde:**
+- `AppManager.js:1-141` — a classe inteira.
+- `utils.js:1-7` — objeto `config` com `dbPass: "senha_super_secreta_prod_123"` e `paymentGatewayKey: "pk_live_1234567890abcdef"`.
+- `AppManager.js:45` — `console.log(\`Processando cartão ${cc} na chave ${config.paymentGatewayKey}\`)`.
+
+**Por que é relevante:** são duas falhas que se reforçam. A primeira é estrutural: `AppManager` cria a conexão com o banco no construtor (`AppManager.js:7`), define o schema e o seed (`initDb`, linhas 10-23), registra as rotas HTTP (`setupRoutes`, linha 25), e ainda implementa a "autorização" do pagamento (linha 46). É a definição literal de God Class — não há como testar a regra de checkout sem subir um SQLite e um Express junto, porque a regra só existe dentro do callback da rota. Também não há injeção de dependência: o banco é instanciado com `new sqlite3.Database` dentro do próprio construtor, então trocar SQLite por Postgres significa reescrever o arquivo todo.
+
+A segunda é de segurança e é pior: as credenciais de produção estão versionadas em texto puro no repositório (o prefixo `pk_live_` indica chave de gateway real, não sandbox), e o `console.log` da linha 45 imprime **o número do cartão do cliente junto com a chave do gateway** em toda transação. Qualquer coletor de log — arquivo, Docker, CloudWatch — passa a armazenar dado de cartão em claro, o que quebra PCI-DSS diretamente. Em PHP é o mesmo erro de deixar a senha do banco no `config.php` commitado e dar `error_log($_POST)` no checkout.
+
+**Agravantes na mesma família:**
+- `utils.js:17-23` — `badCrypto` não é hash: concatena o **base64** da senha 10.000 vezes e devolve os 10 primeiros caracteres. Base64 é reversível, e o corte em 10 chars significa que só os 5 primeiros caracteres da senha influenciam o resultado — colisão trivial. Além disso, o loop de 10.000 iterações é puro desperdício de CPU, síncrono, bloqueando o event loop.
+- `AppManager.js:68` — se o cliente não mandar senha, o sistema cria a conta com a senha default `"123456"` silenciosamente, sem avisar ninguém.
+- `AppManager.js:18` — seed grava a senha `'123'` em texto puro, sem passar nem pelo `badCrypto`.
+- `AppManager.js:46` — o "gateway de pagamento" é `cc.startsWith("4") ? "PAID" : "DENIED"`, ou seja, qualquer cartão começando com 4 é aprovado. Regra de integração externa hardcoded dentro do controller, sem abstração de gateway.
+- `utils.js:9-10` — `globalCache` e `totalRevenue` são estado global mutável exportado do módulo; o cache cresce indefinidamente (`logAndCache`, linha 12-15) sem TTL nem limite de tamanho.
+
+**Correção esperada:** quebrar o `AppManager` em camadas (routes → controllers → services → repositories), injetar a conexão de banco em vez de instanciá-la; mover toda a `config` para variáveis de ambiente e remover o arquivo do histórico; nunca logar PAN de cartão; substituir `badCrypto` por `bcrypt`/`argon2`; extrair o gateway de pagamento para uma interface com implementação real e fake.
+
+---
+
+#### 2. [MEDIUM] Query N+1 em dois níveis no relatório financeiro, com contadores manuais de concorrência
+
+**Onde:** `AppManager.js:80-129` (`GET /api/admin/financial-report`).
+
+**Por que é relevante:** o endpoint faz `SELECT * FROM courses` e, para cada curso, dispara um `SELECT` de matrículas (linha 92); para cada matrícula, dispara **mais dois** `SELECT` — um de usuário (linha 104) e um de pagamento (linha 106). Com 20 cursos e 30 matrículas por curso são `1 + 20 + (600 × 2) = 1.221` queries para montar um relatório que um único `SELECT` com três `JOIN` (`courses` → `enrollments` → `users` + `payments`) resolveria. Não há `LIMIT`, paginação nem filtro de período: o relatório sempre varre a base inteira e piora linearmente com o crescimento.
+
+Pior que o N+1 é o controle de fluxo. Como o `sqlite3` é assíncrono por callback, o autor teve que inventar dois contadores manuais (`coursesPending`, linha 86, e `enrPending`, linha 93) para saber quando responder. Isso gera três defeitos concretos:
+- **Race condition na ordem:** `report.push(courseData)` (linhas 96 e 119) executa na ordem de conclusão das queries, não na ordem dos cursos — o mesmo request devolve o relatório em ordens diferentes a cada chamada.
+- **Erros ignorados:** os callbacks das linhas 104 e 106 recebem `err` e nunca o checam; um erro de banco vira `user = undefined` e o relatório mostra `'Unknown'` como se fosse um dado válido.
+- **Crash em produção:** na linha 93, se a query de matrículas falhar, `enrollments` vem `undefined` e `enrollments.length` lança `TypeError` dentro de um callback assíncrono — sem `try/catch` possível, o processo Node inteiro cai.
+
+**Correção esperada:** substituir os três níveis de callback por uma query agregada com `JOIN` (`SUM` do faturamento no próprio SQL), migrar para a API com `Promise`/`async-await` eliminando os contadores manuais, tratar todos os `err` e adicionar paginação.
+
+---
+
+#### 3. [MEDIUM] Checkout sem transação e banco sem integridade referencial
+
+**Onde:**
+- `AppManager.js:50-63` — a sequência de `INSERT` do checkout.
+- `AppManager.js:12-16` — `CREATE TABLE` sem nenhuma `FOREIGN KEY`.
+- `AppManager.js:131-137` — `DELETE /api/users/:id`.
+
+**Por que é relevante:** o checkout faz quatro escritas encadeadas (usuário → matrícula → pagamento → auditoria) sem `BEGIN TRANSACTION`/`COMMIT`. Se o `INSERT` de pagamento falhar (linha 55), a matrícula da linha 50 **já foi gravada e permanece** — o aluno fica matriculado num curso que nunca pagou, e o sistema devolve 500 como se nada tivesse acontecido. É o caso clássico em que ou tudo é commitado ou nada é. Vale notar que o erro do `INSERT` de auditoria (linha 57) sequer é verificado: o callback recebe `err` e responde `200 Sucesso` de qualquer forma.
+
+Do lado do schema, nenhuma das quatro tabelas declara `FOREIGN KEY` (linhas 12-16) — e o SQLite ainda exige `PRAGMA foreign_keys = ON` para aplicá-las. O resultado está confessado no próprio código: o `DELETE /api/users/:id` responde *"Usuário deletado, mas as matrículas e pagamentos ficaram sujos no banco"* (linha 135). Ou seja, o endpoint gera órfãos por design, ignora o `err` do callback e responde sucesso mesmo quando o `id` não existe.
+
+Some-se a validação de entrada: a linha 35 checa apenas presença dos campos, sem validar formato de e-mail, tipo ou formato do cartão. Se `card` vier como número em vez de string, `cc.startsWith` (linha 46) lança `TypeError` e derruba o processo. Não existe middleware de validação nem `error handler` registrado no Express (`app.js:1-14`).
+
+**Correção esperada:** envolver o checkout em transação com rollback, declarar as `FOREIGN KEY` (com `ON DELETE` explícito) e habilitar o `PRAGMA`, checar todos os `err`, adicionar middleware de validação de payload e um `error handler` central no Express.
+
+---
+
+#### 4. [LOW] Nomenclatura de variáveis e do contrato da API
+
+**Onde:** `AppManager.js:29-33` e o corpo esperado do `POST /api/checkout`.
+
+```js
+let u = req.body.usr;
+let e = req.body.eml;
+let p = req.body.pwd;
+let cid = req.body.c_id;
+let cc = req.body.card;
+```
+
+**Por que é relevante:** cinco variáveis de uma letra numa função de 50 linhas — ao chegar na linha 68 (`badCrypto(p || "123456")`) já não é óbvio que `p` é a senha. O `e` é especialmente ruim porque é a convenção universal de `error`/`event` em JavaScript, o que induz a erro em qualquer manutenção futura. E o problema vaza para fora do código: `usr`, `eml`, `pwd` e `c_id` são o **contrato público da API**, abreviações inconsistentes (`c_id` com underscore, `eml` sem) que qualquer consumidor precisa adivinhar.
+
+No mesmo bloco: tudo é declarado com `let` mesmo nunca sendo reatribuído (deveria ser `const`), e a linha 26 guarda `const self = this` no estilo pré-ES6 — necessário apenas porque os callbacks das linhas 50 e 54 usam `function(err)` para acessar `this.lastID`, misturando dois estilos de `this` no mesmo arquivo (`this.db` nas linhas 37/40, `self.db` nas 54/57).
+
+**Correção esperada:** nomes completos (`userName`, `email`, `password`, `courseId`, `cardNumber`), padronizar o payload da API em `camelCase` descritivo, `const` por padrão e eliminar o `self` extraindo a lógica para métodos/serviços nomeados.
+
+---
+
+#### 5. [LOW] `console.log` como log, código morto e export por valor de estado mutável
+
+**Onde:** `utils.js:9-10`, `utils.js:25`, `utils.js:12-15`, `AppManager.js:45`, `app.js:13`.
+
+**Por que é relevante:** três detalhes pequenos que juntos indicam código nunca revisado.
+- `totalRevenue` (`utils.js:10`) é um número exportado na linha 25. Em CommonJS, exportar um primitivo exporta uma **cópia do valor** — qualquer `totalRevenue += x` dentro de `utils.js` jamais seria visto por quem importou. O `AppManager.js:2` chega a importá-lo e nunca o usa; é uma armadilha esperando alguém "consertar" o acumulador e não entender por que o valor fica sempre em zero. `globalCache` também é exportado (linha 25) e nunca lido em lugar nenhum: o cache é escrito por `logAndCache` e ninguém consome.
+- `logAndCache` (`utils.js:12-15`) faz duas coisas sem relação — loga e escreve em cache — e o nome com "and" denuncia isso.
+- `console.log` é o único mecanismo de log do projeto (`utils.js:13`, `AppManager.js:45`, `app.js:13`), sem nível, timestamp ou destino configurável. Não há como separar erro de informação, nem desligar o log de cartão em produção.
+
+**Correção esperada:** remover o estado global e o código morto, separar cache de log em módulos próprios (cache com TTL, se realmente necessário) e adotar um logger estruturado (`pino`/`winston`) com níveis.
+
+---
+
+**Resumo do projeto 2**
+
+| # | Severidade | Problema | Arquivo principal |
+|---|---|---|---|
+| 1 | CRITICAL | God Class `AppManager` (banco + rotas + negócio + pagamento) com credenciais hardcoded, cartão em log e hash falso | `AppManager.js`, `utils.js` |
+| 2 | MEDIUM | Query N+1 em dois níveis no relatório financeiro, com contadores manuais, race condition e erros ignorados | `AppManager.js` |
+| 3 | MEDIUM | Checkout sem transação, schema sem `FOREIGN KEY` e `DELETE` que gera órfãos | `AppManager.js` |
+| 4 | LOW | Variáveis de uma letra e abreviações inconsistentes no contrato da API (`usr`, `eml`, `c_id`) | `AppManager.js` |
+| 5 | LOW | `console.log` como log, código morto e export por valor de estado mutável | `utils.js` |
