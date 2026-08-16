@@ -4,6 +4,20 @@
 
 Os sinais são escritos para Python e JavaScript porque são as stacks dos projetos-alvo, mas cada anti-pattern é definido de forma independente de linguagem — traduza o sinal para a stack detectada (o equivalente de `print()` em PHP é `echo`/`var_dump`, em Go é `fmt.Println`).
 
+## Antes de rodar qualquer varredura
+
+Todo `grep -r` deste arquivo carrega as exclusões inline:
+
+```bash
+--exclude-dir={.claude,node_modules,.venv,__pycache__}
+```
+
+Sem isso a varredura casa com os exemplos de código dos **próprios arquivos de referência desta skill** (`.claude/skills/refactor-arch/references/*.md` contêm `SECRET_KEY = '...'`, `@app.route`, `print(...)`, `console.log(...)`) e com dependências de terceiros.
+
+Escreva o grupo `{...}` **literalmente**. Não o substitua por uma variável de shell (`$EXCL`): em `zsh` a variável não sofre word-splitting, o valor inteiro vira um único padrão e nenhum diretório é excluído — silenciosamente, sem erro.
+
+Se mesmo assim um match apontar para um caminho dentro de `.claude/`, é a documentação da skill — descarte e confira o comando.
+
 ## Escala de severidade
 
 | Nível | Critério |
@@ -27,8 +41,8 @@ Os sinais são escritos para Python e JavaScript porque são as stacks dos proje
 
 **Detecção**
 ```bash
-grep -rnE "(execute|query|run|all|get)\(.*(\+|%s|%d|\$\{|f\"|f')" --include='*.py' --include='*.js' .
-grep -rnE "(SELECT|INSERT|UPDATE|DELETE).*(\" *\+|' *\+|\$\{|% *\()" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(execute|query|run|all|get)\(.*(\+|%s|%d|\$\{|f\"|f')" --include='*.py' --include='*.js' .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(SELECT|INSERT|UPDATE|DELETE).*(\" *\+|' *\+|\$\{|% *\()" .
 ```
 Sinais: `"SELECT * FROM t WHERE id = " + str(id)`, f-string com variável dentro de `execute()`, template literal `` `... ${x}` `` dentro de `db.run`, `.format()` em query, `%` formatting em query.
 
@@ -42,10 +56,12 @@ Sinais: `"SELECT * FROM t WHERE id = " + str(id)`, f-string com variável dentro
 
 **Detecção**
 ```bash
-grep -rniE "(secret|password|passwd|pwd|api[_-]?key|token|dbpass|private[_-]?key)\s*[:=]\s*['\"]" .
-grep -rnE "(sk_live|pk_live|AKIA|Bearer |mongodb\+srv://|postgres://.*:.*@)" .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(secret|password|passwd|pwd|api[_-]?key|token|dbpass|private[_-]?key)[a-z_]*['\"]?\]?\s*[:=]\s*['\"]" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(sk_live|pk_live|AKIA|Bearer |mongodb\+srv://|postgres://.*:.*@)" .
 ```
 Sinais: `SECRET_KEY = 'minha-chave-123'`, `dbPass: "senha_prod"`, chave de gateway com prefixo `pk_live_`/`sk_live_`, credencial de SMTP no código, connection string com usuário e senha.
+
+**Atenção ao acesso por chave:** o idioma mais comum em Flask é `app.config["SECRET_KEY"] = "..."` e em JS é `config["apiKey"] = "..."` — o nome do segredo vem **dentro de colchete e aspas**, não seguido direto de `=`. Por isso o padrão acima aceita sufixo (`SECRET` → `SECRET_KEY`) e o par `"]` antes do operador. Se você rodar uma variação da regex, garanta que ela casa com essas duas formas antes de concluir "nenhum segredo hardcoded".
 
 **Por que CRITICAL:** o segredo fica versionado no histórico do Git — rotacionar o valor não basta, o commit continua lá. Prefixo `_live_` indica credencial de produção, não sandbox.
 
@@ -73,10 +89,20 @@ Heurística de contagem — conte quantas das responsabilidades abaixo o arquivo
 
 **Detecção**
 ```bash
-grep -rniE "md5|sha1\(|\.hexdigest\(\)|base64|badCrypto|password ==|senha ==|pass ==" .
-grep -rniE "fake.?(jwt|token)|token['\"]?\s*[:=].*\+\s*(str\()?.*id" .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "md5|sha1\(|\.hexdigest\(\)|base64|badCrypto|password ==|senha ==|pass ==" .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "fake.?(jwt|token)|token['\"]?\s*[:=].*\+\s*(str\()?.*id" .
 ```
 Sinais: MD5/SHA1 como hash de senha (com ou sem salt), senha em texto puro no banco, comparação direta `user.password == pwd`, "criptografia" caseira (loop de base64, XOR, `substring`), token previsível (`'fake-jwt-token-' + user.id`), senha default silenciosa quando o campo vem vazio (`badCrypto(p || "123456")`).
+
+**Enumeração de contas no login** — leia o handler de login inteiro, o grep só localiza:
+
+```bash
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "def login|/login|login\(" -A 14 . | grep -nE "if not user|if \(!user|first\(\)"
+```
+
+O sinal é **estrutural, não textual**: o handler retorna 401 assim que não encontra o e-mail, *antes* de executar a verificação de senha. Mesmo com a mensagem de erro idêntica nos dois casos (`'Credenciais inválidas'`), o caminho do e-mail inexistente pula o cálculo do hash e responde mensurável­mente mais rápido — dá para enumerar contas válidas pelo tempo de resposta.
+
+Não confunda com o problema de mensagem distinta (`'Usuário não encontrado'` vs `'Senha incorreta'`), que é o caso óbvio: se as mensagens **já** são uniformes, isso está certo e não deve ser "corrigido" — o que falta é igualar o trabalho executado nos dois caminhos (comparar contra um hash dummy quando o usuário não existe). Correção em RP-04.
 
 **Por que CRITICAL:** MD5 sem salt cai por rainbow table em segundos e senhas iguais geram hashes iguais. Um token sem assinatura e sem expiração dá falsa impressão de autenticação onde não há nenhuma. Verifique também se existe alguma verificação de autorização: um método `is_admin()` definido e **nunca chamado** significa zero controle de acesso.
 
@@ -86,9 +112,9 @@ Sinais: MD5/SHA1 como hash de senha (com ou sem salt), senha em texto puro no ba
 
 **Detecção**
 ```bash
-grep -rniE "'(password|senha|pass|token|secret)'\s*:" .          # campo em serialização de saída
-grep -rniE "(console\.log|print|logger)\(.*(card|cc|cvv|password|senha|secret|key)" .
-grep -rniE "@app\.route\(.*(admin|debug|query|reset)" .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "'(password|senha|pass|token|secret)'\s*:" .          # campo em serialização de saída
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(console\.log|print|logger)\(.*(card|cc|cvv|password|senha|secret|key)" .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "@[a-z_]*\.route\(.*(admin|debug|query|reset)" .
 ```
 Sinais: `to_dict()` / serializer incluindo `password`; `SECRET_KEY` devolvida por `/health`; número de cartão em log; endpoint que executa **SQL arbitrário** vindo do corpo da requisição; endpoint destrutivo (`reset-db`, `DELETE /all`) sem autenticação; stack trace completo na resposta de erro.
 
@@ -104,8 +130,19 @@ Sinais: `to_dict()` / serializer incluindo `password`; `SECRET_KEY` devolvida po
 
 **Detecção**
 ```bash
-grep -rnE "@(app|bp)\.route|app\.(get|post|put|delete)\(" -A 40 . | grep -nE "SELECT|INSERT|if .*>|for .*in|\* 0\.|cursor"
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "@[a-z_]*\.route|add_url_rule|(app|router)\.(get|post|put|delete|use)\(" -A 40 . | grep -nE "SELECT|INSERT|if .*>|for .*in|\* 0\.|cursor"
 ```
+
+**Cuidado com a forma de registro da rota** — ela varia por projeto e uma regex estreita demais devolve zero achados num projeto cheio deles. As três formas que precisam ser cobertas:
+
+| Forma | Exemplo | Onde aparece |
+|---|---|---|
+| Decorator no app | `@app.route('/health')` | Flask monolítico |
+| Decorator em blueprint com prefixo próprio | `@task_bp.route(...)`, `@user_bp.route(...)` | Flask organizado — o prefixo é o nome do blueprint, **não** `bp` |
+| Registro imperativo | `app.add_url_rule("/produtos", ...)`, `app.post('/api/checkout', ...)`, `router.get(...)` | Flask sem decorator, Express |
+
+Se a varredura de rotas não bater com a contagem de endpoints da Fase 1, a regex está errada — refaça antes de marcar AP-06 como ausente.
+
 Sinais: handler HTTP que faz SQL direto, calcula preço/desconto/imposto, monta o dicionário de resposta campo a campo e valida entrada — tudo no mesmo corpo de função. Um handler de 50+ linhas quase sempre é isso. Sintoma inverso: existe uma pasta `services/` e nenhum arquivo a importa.
 
 **Por que HIGH:** a regra só é alcançável por requisição HTTP; não dá para testá-la nem reusá-la (job, CLI, worker). É a violação de MVC mais comum em projetos "parcialmente organizados".
@@ -116,8 +153,8 @@ Sinais: handler HTTP que faz SQL direto, calcula preço/desconto/imposto, monta 
 
 **Detecção**
 ```bash
-grep -rnE "new sqlite3\.Database|sqlite3\.connect|createConnection|new .*Client\(" .
-grep -rn "import " --include='*model*' --include='*service*' . | grep -iE "db|database|config"
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "new sqlite3\.Database|sqlite3\.connect|createConnection|new .*Client\(" .
+grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "import " --include='*model*' --include='*service*' . | grep -iE "db|database|config"
 ```
 Sinais: módulo instancia a própria conexão de banco (`this.db = new sqlite3.Database(...)` no construtor), service faz `import` direto do módulo de banco, `datetime.now()` chamado no meio da regra de negócio (impede testar data), cliente HTTP externo instanciado dentro da função que o usa.
 
@@ -129,9 +166,9 @@ Sinais: módulo instancia a própria conexão de banco (`this.db = new sqlite3.D
 
 **Detecção**
 ```bash
-grep -rnE "^(let|var) [a-zA-Z_]+ *= *(\{\}|\[\]|0)" --include='*.js' .
-grep -rnE "^[A-Za-z_]+ *= *(\{\}|\[\])" --include='*.py' .
-grep -rn "global " --include='*.py' .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "^(let|var) [a-zA-Z_]+ *= *(\{\}|\[\]|0)" --include='*.js' .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "^[A-Za-z_]+ *= *(\{\}|\[\])" --include='*.py' .
+grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "global " --include='*.py' .
 ```
 Sinais: `let globalCache = {}` exportado do módulo, acumulador global (`totalRevenue`), cache de módulo sem TTL nem limite de tamanho, `global x` em Python.
 
@@ -143,8 +180,8 @@ Sinais: `let globalCache = {}` exportado do módulo, acumulador global (`totalRe
 
 **Detecção**
 ```bash
-grep -rnE "INSERT INTO" -A 12 . | grep -cE "INSERT INTO"    # múltiplos INSERT encadeados no mesmo handler
-grep -rniE "begin( transaction)?|commit|rollback|session\.begin|with .*transaction" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "INSERT INTO" -A 12 . | grep -cE "INSERT INTO"    # múltiplos INSERT encadeados no mesmo handler
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "begin( transaction)?|commit|rollback|session\.begin|with .*transaction" .
 ```
 Sinais: dois ou mais `INSERT`/`UPDATE` dependentes no mesmo fluxo (checkout: usuário → matrícula → pagamento → auditoria) sem `BEGIN`/`COMMIT`/`ROLLBACK`; `db.commit()` chamado a cada passo em vez de uma vez no fim; ausência de `FOREIGN KEY` nas `CREATE TABLE`; no SQLite, `FOREIGN KEY` declarada sem `PRAGMA foreign_keys = ON` (não é aplicada).
 
@@ -156,12 +193,21 @@ Sinais: dois ou mais `INSERT`/`UPDATE` dependentes no mesmo fluxo (checkout: usu
 
 **Detecção**
 ```bash
-grep -rn "except:" --include='*.py' .            # except nu
-grep -rnE "except Exception( as e)?:\s*(pass|$)" --include='*.py' .
-grep -rnE "\(err[,)]" --include='*.js' . | wc -l   # compare com o nº de checagens de err
-grep -rniE "errorhandler|app\.use\(\(err|middleware.*error" .
+grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "except:" --include='*.py' .            # except nu
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "except Exception( as e)?:\s*(pass|$)" --include='*.py' .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "\(err[,)]" --include='*.js' . | wc -l   # compare com o nº de checagens de err
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "errorhandler|app\.use\(\(err|middleware.*error" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(let|var|const) [a-zA-Z]*([Pp]ending|[Rr]emaining|[Cc]ounter) *=" --include='*.js' .   # contador manual de concorrência
 ```
 Sinais: `except:` nu (captura até `KeyboardInterrupt`/`SystemExit`); `catch` vazio; callback que recebe `err` e nunca o checa (`(err) => { res.send("ok") }`); `try/except` repetido em cada handler devolvendo `{'error': 'Erro interno'}, 500` **sem registrar stack trace**; nenhum `@app.errorhandler` / `app.use((err, req, res, next))` registrado.
+
+**Contador manual de concorrência** (`let coursesPending = courses.length` decrementado dentro de `forEach`, respondendo quando chega a zero) é sinal de três defeitos de uma vez, e cada um deve entrar como sub-item do finding:
+
+1. **Ordem não determinística** — o `push` no array de resposta acontece na ordem de conclusão das queries, não na ordem da lista de origem. O mesmo request devolve o resultado em ordens diferentes a cada chamada, sem nenhum `ORDER BY` para garantir estabilidade.
+2. **Erros ignorados** — os callbacks internos recebem `err` e não o checam; a falha vira `undefined` e é serializada como valor válido (`'Unknown'`).
+3. **Queda do processo** — `rows.length` de um `undefined` dentro de callback assíncrono lança `TypeError` fora de qualquer `try/catch` alcançável, derrubando o Node inteiro.
+
+O contador existe porque a API é por callback; a correção é migrar para `Promise`/`async-await` (RP-14) e, quando for varredura de relacionamento, colapsar tudo em uma query com `JOIN` (RP-08) — aí o contador desaparece junto com a race condition.
 
 **Por que HIGH:** o erro desaparece — sem stack trace no log e sem detalhe na resposta, o bug fica invisível em produção. Além disso, `err` ignorado em callback assíncrono vira `undefined` mais adiante e derruba o processo Node inteiro (`enrollments.length` de um `undefined`), fora de qualquer `try/catch`.
 
@@ -175,8 +221,8 @@ Sinais: `except:` nu (captura até `KeyboardInterrupt`/`SystemExit`); `catch` va
 
 **Detecção**
 ```bash
-grep -rnE "for .* in .*:" -A 8 --include='*.py' . | grep -E "execute|\.query\.|\.get\(|filter_by"
-grep -rnE "\.(forEach|map)\(" -A 8 --include='*.js' . | grep -E "db\.(get|all|run)|SELECT"
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "for .* in .*:" -A 8 --include='*.py' . | grep -E "execute|\.query\.|\.get\(|filter_by"
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "\.(forEach|map)\(" -A 8 --include='*.js' . | grep -E "db\.(get|all|run)|SELECT"
 ```
 Sinais: query dentro de laço; `User.query.get(x.user_id)` dentro de um `for` sobre a lista; `db.get(...)` dentro de `forEach`; contagem feita percorrendo registros em Python/JS em vez de `COUNT`/`GROUP BY`; ORM com relacionamento **declarado e não usado** (`task.user` existe no model, mas o código refaz `User.query.get(t.user_id)`); `len(u.tasks)` disparando lazy load por usuário.
 
@@ -190,8 +236,8 @@ Sinais: query dentro de laço; `User.query.get(x.user_id)` dentro de um `for` so
 
 **Detecção**
 ```bash
-grep -rnE "\.all\(\)|SELECT \* FROM [a-z_]+ *(;|\"|')" . | grep -viE "limit|offset|paginate"
-grep -rnE "request\.args\.get\(.(page|limit|per_page)" .   # ausência é o sinal
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "\.all\(\)|SELECT \* FROM [a-z_]+ *(;|\"|')" . | grep -viE "limit|offset|paginate"
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "request\.args\.get\(.(page|limit|per_page)" .   # ausência é o sinal
 ```
 Sinais: endpoint de listagem sem `LIMIT`/`OFFSET`, sem `paginate()`, sem parâmetros `page`/`limit`; relatório que varre a tabela inteira sem filtro de período; carregar todos os registros em memória para filtrar depois na aplicação (`[t for t in all_tasks if t.due_date < now]` no lugar de um `WHERE`).
 
@@ -203,8 +249,8 @@ Sinais: endpoint de listagem sem `LIMIT`/`OFFSET`, sem `paginate()`, sem parâme
 
 **Detecção**
 ```bash
-grep -rn "def criar\|def atualizar\|def create_\|def update_" -A 30 .   # comparar blocos
-grep -rniE "valid_status|VALID_|\[('|\")(pending|done|ativo)" . | sort | uniq -c | sort -rn
+grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "def criar\|def atualizar\|def create_\|def update_" -A 30 .   # comparar blocos
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "valid_status|VALID_|\[('|\")(pending|done|ativo)" . | sort | uniq -c | sort -rn
 ```
 Sinais: o mesmo bloco de validação copiado entre `create` e `update`; a mesma regra ("está atrasada", "é elegível a desconto") reimplementada em 3+ handlers; o mesmo dicionário de serialização montado à mão em várias funções; o mesmo regex de e-mail em dois arquivos; listas literais de valores válidos (`['pending','done']`) repetidas dentro de handlers.
 
@@ -218,9 +264,14 @@ Sinais: o mesmo bloco de validação copiado entre `create` e `update`; a mesma 
 
 **Detecção**
 ```bash
-grep -rnE "req\.body\.|request\.get_json\(\)|request\.json" -A 6 . | grep -viE "if not|schema|validate|marshmallow|joi|zod"
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "req\.body\.|request\.get_json\(\)|request\.json" -A 6 . | grep -viE "if not|schema|validate|marshmallow|joi|zod"
+```
+```bash
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "len\((password|senha|pwd)[^)]*\) *< *[0-9]|\.length *< *[0-9]|MIN_PASSWORD_LENGTH *= *[0-9]" .   # política de senha
 ```
 Sinais: leitura direta de `req.body.x` sem checar tipo nem formato; validação só de presença (`if (!u || !e)`) sem validar formato de e-mail, faixa numérica ou tipo; nenhum middleware de validação registrado; nenhuma biblioteca de schema (marshmallow, pydantic, joi, zod) usada apesar de declarada no manifesto.
+
+**Política de senha fraca** é sub-item deste anti-pattern: mínimo abaixo de 8 caracteres (`if len(password) < 4`), ausência de qualquer mínimo, ou senha default preenchida pelo servidor quando o campo vem vazio (esta última sobe para AP-04, porque cria conta acessível sem o usuário saber). Um mínimo de 4 caracteres reduz o espaço de busca a ponto de tornar o *brute force* trivial, independentemente do algoritmo de hash — e costuma vir acompanhado da constante correta já definida e ignorada (`MIN_PASSWORD_LENGTH` em um módulo de helpers que ninguém importa), o que liga este achado ao AP-16 e ao AP-19.
 
 **Por que MEDIUM:** um campo com tipo inesperado quebra a aplicação — `cc.startsWith(...)` lança `TypeError` se `card` vier como número, e em callback assíncrono isso derruba o processo. Validação espalhada por handler também é a origem do AP-13.
 
@@ -231,8 +282,8 @@ Sinais: leitura direta de `req.body.x` sem checar tipo nem formato; validação 
 **Detecção** — rode a varredura completa abaixo e reporte cada ocorrência com a substituta:
 
 ```bash
-grep -rnE "utcnow\(\)|datetime\.utcfromtimestamp|Query\.get\(|query\.get\(|before_first_request" --include='*.py' .
-grep -rnE "new Buffer\(|url\.parse\(|\.substr\(|createCipher\(|require\('request'\)|util\.isArray" --include='*.js' .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "utcnow\(\)|datetime\.utcfromtimestamp|Query\.get\(|query\.get\(|before_first_request|type\([^)]*\) *==" --include='*.py' .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "new Buffer\(|url\.parse\(|\.substr\(|createCipher\(|require\('request'\)|util\.isArray" --include='*.js' .
 ```
 
 | Stack | Deprecated | Substituto |
@@ -240,6 +291,7 @@ grep -rnE "new Buffer\(|url\.parse\(|\.substr\(|createCipher\(|require\('request
 | Python 3.12+ | `datetime.utcnow()`, `datetime.utcfromtimestamp()` | `datetime.now(timezone.utc)` |
 | Python 3.12+ | `imp`, `distutils` | `importlib`, `setuptools`/`packaging` |
 | Python | `assertEquals`, `@asyncio.coroutine` | `assertEqual`, `async def` |
+| Python | `type(x) == list` | `isinstance(x, list)` — não é depreciação formal, mas é idioma obsoleto: falha com subclasses e é o que `isinstance` existe para resolver |
 | Flask 2.3+ | `@app.before_first_request` | inicialização no application factory |
 | Flask | `flask.json.JSONEncoder`, `app.json_encoder` | `app.json_provider_class` |
 | SQLAlchemy 2.0 | `Model.query.get(id)` | `db.session.get(Model, id)` |
@@ -269,8 +321,8 @@ Verifique também no manifesto se alguma dependência está em versão sem supor
 
 **Detecção**
 ```bash
-grep -rnE "(>|<|>=|<=|==) *[0-9]{2,}|\* *0\.[0-9]+|days=[0-9]+|priority *<= *[0-9]" .
-grep -rnE "\[['\"](pending|done|ativo|admin|PAID)" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(>|<|>=|<=|==) *[0-9]{2,}|\* *0\.[0-9]+|days=[0-9]+|priority *<= *[0-9]" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "\[['\"](pending|done|ativo|admin|PAID)" .
 ```
 Sinais: faixas de desconto (`if faturamento > 10000: desconto = faturamento * 0.1`), limites de tamanho (`len(titulo) > 200`), `timedelta(days=7)`, `if t.priority <= 2` codificando "alta prioridade" sem nome, listas literais de status/roles espalhadas.
 
@@ -282,8 +334,8 @@ Sinais: faixas de desconto (`if faturamento > 10000: desconto = faturamento * 0.
 
 **Detecção**
 ```bash
-grep -rn "print(" --include='*.py' . | grep -v test
-grep -rn "console\.log(" --include='*.js' .
+grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "print(" --include='*.py' . | grep -v test
+grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "console\.log(" --include='*.js' .
 ```
 Sinais: `print`/`console.log` como único mecanismo de log — sem nível, timestamp ou destino configurável; log de dado pessoal (e-mail, CPF) em texto puro; `print("ENVIANDO EMAIL: ...")` **no lugar** de um efeito colateral real (a funcionalidade não existe, está fingida por um log).
 
@@ -295,7 +347,7 @@ Sinais: `print`/`console.log` como único mecanismo de log — sem nível, times
 
 **Detecção**
 ```bash
-grep -rnE "(let|var|const) [a-z] *=|def [a-z]\(|\b(tmp|data2|aux|foo|obj)\b" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(let|var|const) [a-z] *=|def [a-z]\(|\b(tmp|data2|aux|foo|obj)\b" .
 ```
 Sinais: variáveis de uma letra em função longa (`u`, `e`, `p`, `cc`); abreviações inconsistentes que vazam para o **contrato público da API** (`usr`, `eml`, `pwd`, `c_id`); nome que sombreia builtin (`id`, `list`, `type` em Python); função com "and" no nome denunciando duas responsabilidades (`logAndCache`); `let` onde nunca há reatribuição; `const self = this` misturado com arrow functions no mesmo arquivo.
 
@@ -308,13 +360,23 @@ Sinais: variáveis de uma letra em função longa (`u`, `e`, `p`, `cc`); abrevia
 **Detecção**
 ```bash
 # import declarado e símbolo nunca referenciado
-grep -rn "^import \|^from .* import " --include='*.py' .
-# módulo que ninguém importa
-for f in $(find . -name '*.py' -path '*/services/*' -o -name '*.js' -path '*/utils/*'); do
-  b=$(basename "$f" | sed 's/\..*//'); echo "$b: $(grep -rl "$b" --include='*.py' --include='*.js' . | grep -v "$f" | wc -l)"
+grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "^import \|^from .* import " --include='*.py' .
+# módulo que ninguém importa — cobre services/ e utils/ nas duas linguagens
+for f in $(find . \( -path '*/services/*' -o -path '*/utils/*' -o -path '*/helpers/*' -o -path '*/lib/*' \) \
+                  \( -name '*.py' -o -name '*.js' \) \
+                  -not -path './.claude/*' -not -path './node_modules/*' -not -name '__init__.py'); do
+  b=$(basename "$f" | sed 's/\..*//')
+  echo "$b: $(grep -rl --exclude-dir={.claude,node_modules,.venv,__pycache__} "$b" --include='*.py' --include='*.js' . | grep -v "$f" | wc -l) importador(es)"
 done
 ```
 Sinais: `import os, sys, json` sem nenhum uso; função utilitária definida e nunca chamada; **módulo inteiro que nenhum arquivo importa** (um `notification_service.py` pronto que a API nunca aciona — a funcionalidade de notificação simplesmente não existe); export de símbolo que ninguém consome; variável importada e não usada.
+
+**Como ler a contagem do laço acima:**
+
+| Resultado | Leitura |
+|---|---|
+| `0 importador(es)` | camada morta confirmada — o módulo inteiro está desligado do fluxo |
+| `1+ importador(es)` | **não conclua que está vivo.** O caso mais comum em projeto "organizado" é o import existir no topo do arquivo e a função nunca ser chamada. Confirme com `grep -n "<nome_da_função>("` nos importadores: se só aparece na linha do `import`, é morto do mesmo jeito |
 
 **Por que importa:** a pasta sugere uma arquitetura que o código não pratica, e o leitor seguinte acredita que a funcionalidade existe.
 

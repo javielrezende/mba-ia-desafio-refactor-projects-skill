@@ -15,14 +15,24 @@ node_modules/  vendor/  .venv/  venv/  __pycache__/  dist/  build/  target/
 .git/  .claude/  coverage/  *.min.js  *.lock  package-lock.json  *.db  *.sqlite
 ```
 
+`.claude/` é o diretório da **própria skill**: seus arquivos de referência contêm exemplos de código (`SECRET_KEY = '...'`, `@app.route`, `print(...)`) que casam com os sinais de detecção. Contá-los infla a Fase 1 e gera falso-positivo na Fase 2.
+
+Por isso todo `grep -r` deste arquivo e do `antipattern-catalog.md` carrega as exclusões inline:
+
+```bash
+--exclude-dir={.claude,node_modules,.venv,__pycache__}
+```
+
+Escreva o grupo `{...}` **literalmente** no comando. Não substitua por uma variável de shell (`$EXCL`): em `zsh` — shell padrão em muitos ambientes — uma variável não sofre word-splitting, o valor inteiro vira um único padrão de exclusão e nenhum diretório é filtrado, **sem erro nenhum**. A varredura parece limpa e continua casando com os arquivos da skill.
+
 **Contagem (rode, não estime):**
 
 ```bash
 # arquivos-fonte + linhas, Python
-find . -name '*.py' -not -path './.venv/*' -not -path './__pycache__/*' | xargs wc -l
+find . -name '*.py' -not -path './.claude/*' -not -path './.venv/*' -not -path './__pycache__/*' | xargs wc -l
 
 # arquivos-fonte + linhas, JS/TS
-find . \( -name '*.js' -o -name '*.ts' \) -not -path './node_modules/*' | xargs wc -l
+find . \( -name '*.js' -o -name '*.ts' \) -not -path './.claude/*' -not -path './node_modules/*' | xargs wc -l
 ```
 
 Arquivos de seed/migração e de teste contam como fonte, mas devem ser marcados como tal no resumo (ex.: `5 files analyzed (1 seed)`).
@@ -81,7 +91,7 @@ Se **nenhum** framework web for detectado, diga "Framework: nenhum (script/CLI)"
 3. Nomes que aparecem em `SELECT ... FROM <x>` / `INSERT INTO <x>` quando não houver DDL no repositório.
 
 ```bash
-grep -rniE "create table|__tablename__|db\.Model|INSERT INTO|FROM [a-z_]+" --include='*.py' --include='*.js' .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "create table|__tablename__|db\.Model|INSERT INTO|FROM [a-z_]+" --include='*.py' --include='*.js' .
 ```
 
 Registre também **onde** o schema vive: um `database.py` dedicado, um `.sql`, migrations — ou dentro de uma classe de aplicação (isso já antecipa um God Class na Fase 2).
@@ -92,7 +102,7 @@ Registre também **onde** o schema vive: um `database.py` dedicado, um `.sql`, m
 
 O domínio sai do cruzamento de três evidências, nunca do nome do diretório:
 
-1. **Rotas** — `grep -rnE "@app\.route|@bp\.route|add_url_rule|app\.(get|post|put|delete)\(|router\." .`
+1. **Rotas** — `grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "@[a-z_]*\.route|add_url_rule|(app|router)\.(get|post|put|delete)\(" .` (o prefixo do decorator é o nome do blueprint — `@task_bp.route`, não só `@app.route`)
 2. **Tabelas/entidades** — do passo 3.
 3. **README do projeto e arquivos de exemplo** (`api.http`, `*.rest`, coleções Postman) — costumam nomear o negócio e revelar o contrato esperado dos endpoints.
 
@@ -118,13 +128,13 @@ Classifique em um dos padrões abaixo e justifique em uma linha:
 
 ```bash
 # SQL dentro de arquivo de rota/controller
-grep -rniE "select |insert into|update .* set|delete from" --include='*routes*' --include='*controller*' .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "select |insert into|update .* set|delete from" --include='*routes*' --include='*controller*' .
 
 # framework HTTP dentro de model/service (request/response fora da camada de entrada)
-grep -rniE "request\.|jsonify|res\.(send|json)|req\.body" --include='*model*' --include='*service*' .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "request\.|jsonify|res\.(send|json)|req\.body" --include='*model*' --include='*service*' .
 
 # camadas mortas: arquivo existe mas ninguém importa
-grep -rn "notification_service\|helpers" --include='*.py' . | grep -i import
+grep -rn --exclude-dir={.claude,node_modules,.venv,__pycache__} "notification_service\|helpers" --include='*.py' . | grep -i import
 ```
 
 Um módulo dentro de `services/`/`utils/` que **nenhum arquivo importa** é camada morta — registre no mapa, vira finding LOW/MEDIUM na Fase 2.

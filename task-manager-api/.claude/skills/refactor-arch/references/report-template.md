@@ -62,7 +62,9 @@ Phase 2 complete. Proceed with refactoring (Phase 3)? [y/n]
 
 ---
 
-## B. Arquivo `reports/audit-<projeto>.md`
+## B. Arquivo em `reports/`
+
+Caminho e nome seguem a regra "Onde salvar o relatório" do `SKILL.md` — `reports/` na **raiz do repositório**, com o nome vindo do pedido do usuário, da convenção já existente na pasta, ou do nome do diretório do projeto.
 
 Mesmo conteúdo, em Markdown, com o cabeçalho de contexto e as seções de fechamento.
 

@@ -87,7 +87,25 @@ Só execute após o `y`.
    - rode uma varredura final dos sinais do catálogo e confirme que os anti-patterns tratados não reaparecem no código novo.
    - Se algo falhar, **corrija antes de declarar sucesso**. Nunca reporte validação verde sem ter executado o boot e as chamadas.
 7. Imprima o bloco `PHASE 3: REFACTORING COMPLETE` com a nova árvore de diretórios, o resultado real da validação e a lista de breaking changes de segurança (se houver).
-8. Salve o relatório de auditoria em `reports/audit-<projeto>.md` (crie o diretório se preciso), agora acrescido da seção "Resultado da Refatoração".
+8. Salve o relatório de auditoria, agora acrescido da seção "Resultado da Refatoração".
+
+### Onde salvar o relatório
+
+O destino é `reports/` **na raiz do repositório**, não dentro do diretório do projeto:
+
+```bash
+git rev-parse --show-toplevel     # raiz do repo; se não for um repo git, use o diretório do projeto
+```
+
+Quando o repositório reúne vários projetos, os relatórios dos três ficam no mesmo `reports/` — é o que o leitor espera encontrar, e salvar em `<projeto>/reports/` espalha a entrega.
+
+Nome do arquivo, nesta ordem de precedência:
+
+1. O nome que o usuário pediu.
+2. A convenção já usada pelo `reports/` existente (ex.: se já há `audit-project-1.md`, o próximo é `audit-project-2.md`).
+3. `audit-<nome-do-diretório-do-projeto>.md`.
+
+Confirme o caminho final junto com o `y` da Fase 2, antes de escrever qualquer arquivo. Crie o diretório se preciso.
 
 ### Sobre remover o código antigo
 

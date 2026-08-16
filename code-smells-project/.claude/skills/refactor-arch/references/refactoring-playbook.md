@@ -175,7 +175,24 @@ if (!password) throw new ValidationError('senha é obrigatória');   // nunca de
 const hash = await bcrypt.hash(password, 12);
 ```
 
-Junto: middleware de autenticação nas rotas de escrita, verificação de autorização de fato chamada (`is_admin()` que existe precisa ser usada), e resposta de login uniforme para e-mail inexistente e senha errada (evita enumeração de contas).
+Junto: middleware de autenticação nas rotas de escrita e verificação de autorização de fato chamada (`is_admin()` que existe precisa ser usada).
+
+**Login sem enumeração de contas** — a mensagem uniforme não basta; o *tempo* também precisa ser:
+
+```python
+DUMMY_HASH = bcrypt.hashpw(b"x", bcrypt.gensalt()).decode()   # custo fixo, calculado no import
+
+def authenticate(email: str, raw_password: str) -> User:
+    user = repository.find_by_email(email)
+    # compara sempre — com o hash real ou com o dummy — para o custo não denunciar
+    # se o e-mail existe. Sem isso, o caminho "não encontrado" responde antes e vaza a conta.
+    hashed = user.password_hash if user else DUMMY_HASH
+    if not bcrypt.checkpw(raw_password.encode(), hashed.encode()) or not user:
+        raise CredenciaisInvalidasError()          # mesma exceção, mesma mensagem, mesmo status
+    return user
+```
+
+O `return 401` logo após `if not user:` é o anti-pattern: ele pula o cálculo do hash e responde mensuravelmente mais rápido do que o caminho da senha errada.
 
 ---
 
