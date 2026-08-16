@@ -446,3 +446,100 @@ A skill deve atingir os seguintes mínimos em **todos os 3 projetos**:
 - **Projetos diferentes exigem adaptação** — a Fase 3 de um projeto já parcialmente organizado não vai ter as mesmas transformações de um monolito. Sua skill deve se adaptar ao contexto.
 - **Pedir confirmação na Fase 2 é obrigatório** — o humano deve revisar o relatório antes de qualquer modificação.
 - **Consulte as referências do curso** — revise a documentação oficial da ferramenta escolhida e os materiais das aulas para relembrar a estrutura e anatomia de uma skill.
+
+---
+
+## Análise Manual
+
+Leitura manual do código, sem ferramenta automatizada. Achados listados por severidade, com arquivo/linha e o motivo de cada um ser relevante.
+
+### Projeto 1 — `code-smells-project/` (Python/Flask — API de E-commerce)
+
+**Estrutura atual:** 4 arquivos na raiz — `app.py` (rotas), `controllers.py` (handlers), `models.py` (acesso a dados), `database.py` (conexão + schema + seed). Existe uma separação nominal de camadas, mas ela vaza em vários pontos.
+
+---
+
+#### 1. [CRITICAL] SQL Injection — queries montadas por concatenação de string
+
+**Onde:** `models.py` — praticamente todas as funções. Exemplos:
+- `models.py:28` — `"SELECT * FROM produtos WHERE id = " + str(id)`
+- `models.py:47-50` — `INSERT INTO produtos ... VALUES ('" + nome + "', '" + descricao + "', ...`
+- `models.py:109-111` — `"SELECT * FROM usuarios WHERE email = '" + email + "' AND senha = '" + senha + "'"`
+- `models.py:291` — `" AND (nome LIKE '%" + termo + "%' ...)"`
+
+**Por que é relevante:** o banco é SQLite via `sqlite3`, que suporta *placeholders* (`?`) — e o próprio `database.py:70-73` já usa `executemany` com `?` no seed, ou seja, a forma correta existe no projeto e simplesmente não foi usada no resto. O caso mais grave é o `login_usuario`: uma senha como `' OR '1'='1` derruba a autenticação inteira e devolve o primeiro usuário da tabela (que no seed é o **admin**, `database.py:76`). Nos endpoints de escrita a concatenação permite terminar a query e alterar/apagar dados. É o equivalente exato ao `mysql_query("SELECT ... WHERE id = $_GET['id']")` que se aprende que nunca deve ser escrito — aqui está em ~15 lugares.
+
+**Agravantes na mesma família (mesma raiz, mesma correção de rota):**
+- `app.py:59-78` — endpoint `POST /admin/query` executa **SQL arbitrário** enviado no corpo da requisição, sem autenticação. Não é nem injeção: é um console de banco aberto na internet.
+- `app.py:47-57` — `POST /admin/reset-db` apaga as 4 tabelas, também sem autenticação.
+- `app.py:7` / `controllers.py:289` — `SECRET_KEY` hardcoded no código **e devolvida em texto puro** pelo `/health`, junto com `debug: True` e o caminho do banco. Endpoint de health check é tipicamente público.
+- Senhas gravadas e comparadas em texto puro (`database.py:76-78`, `models.py:110`) e o `/usuarios` devolve o campo `senha` de todos os usuários no JSON (`models.py:83`).
+
+**Correção esperada:** queries parametrizadas em 100% dos acessos, hash de senha (bcrypt/argon2), remoção dos endpoints `/admin/*` (ou autenticação + autorização real), `SECRET_KEY` e `DEBUG` vindos de variável de ambiente, e o campo `senha` fora de qualquer serialização de saída.
+
+---
+
+#### 2. [MEDIUM] Query N+1 na listagem de pedidos
+
+**Onde:** `models.py:171-201` (`get_pedidos_usuario`) e `models.py:203-233` (`get_todos_pedidos`) — o mesmo trecho, duplicado.
+
+**Por que é relevante:** o padrão é o clássico N+1, aqui em **dois níveis aninhados**. Para cada pedido abre-se um cursor e uma query nova para buscar os itens (`models.py:188`), e **para cada item** abre-se mais um cursor e mais uma query para buscar o nome do produto (`models.py:192`). Uma listagem de 50 pedidos com 4 itens cada dispara `1 + 50 + 200 = 251` queries onde um único `SELECT` com dois `JOIN` (`pedidos` → `itens_pedido` → `produtos`) resolveria. O `GET /pedidos` não tem paginação nem `LIMIT` (`models.py:206`), então o custo cresce linearmente com a tabela inteira e não tem teto. Some-se a isso que não há índice em `itens_pedido.pedido_id` nem em `itens_pedido.produto_id` (`database.py:45-53`): cada uma das 250 queries é um *full table scan*.
+
+**Correção esperada:** substituir os loops por uma query única com `JOIN` e agrupar o resultado em memória; adicionar índices nas chaves estrangeiras; introduzir paginação nos endpoints de listagem.
+
+---
+
+#### 3. [MEDIUM] Validação duplicada no controller e mapeamento de linha repetido no model
+
+**Onde:**
+- `controllers.py:28-54` vs `controllers.py:72-90` — o bloco de validação de produto (campos obrigatórios, preço/estoque negativos, tamanho do nome) está copiado e colado entre `criar_produto` e `atualizar_produto`.
+- `models.py:12-21`, `models.py:31-40` e `models.py:304-313` — o mesmo dicionário de 8 campos de produto é montado à mão em três funções distintas.
+
+**Por que é relevante:** são duas cópias que já começaram a divergir — o `atualizar_produto` **perdeu** a validação de tamanho do nome e a de categoria válida (`controllers.py:47-54`), presentes só na criação. Ou seja, dá para criar um produto com categoria inválida via `PUT` mas não via `POST`. É exatamente o sintoma que a duplicação produz: a regra vive em dois lugares, alguém corrige um e esquece o outro. O mesmo vale para o mapeamento de colunas — adicionar um campo em `produtos` exige lembrar de editar três funções, e esquecer uma gera respostas inconsistentes entre `GET /produtos` e `GET /produtos/busca`.
+
+Vale registrar também que a lista de categorias válidas (`controllers.py:52`) e a de status de pedido (`controllers.py:242`) estão como *arrays* literais dentro do handler HTTP — regra de negócio dentro do controller, sem fonte única de verdade.
+
+**Correção esperada:** extrair um validador/*schema* de produto reutilizado pelos dois handlers, um serializador único por entidade no model, e mover as listas de valores válidos para constantes/enums de domínio.
+
+---
+
+#### 4. [LOW] Magic numbers na regra de desconto do relatório
+
+**Onde:** `models.py:256-262`.
+
+```python
+if faturamento > 10000:
+    desconto = faturamento * 0.1
+elif faturamento > 5000:
+    desconto = faturamento * 0.05
+elif faturamento > 1000:
+    desconto = faturamento * 0.02
+```
+
+**Por que é relevante:** cinco números soltos codificando uma política comercial, sem nenhuma constante nomeada ou comentário explicando de onde vêm. Não dá para saber, lendo o código, se `0.05` é uma faixa de desconto por volume, uma comissão ou um imposto — o nome da variável (`desconto`) é a única pista. Quando o time comercial mudar a faixa, alguém precisa caçar o número no meio da função de relatório. É o tipo de constante que deveria estar nomeada (`FAIXAS_DESCONTO`) e, idealmente, fora do model.
+
+**Correção esperada:** extrair as faixas para constantes nomeadas ou uma estrutura de configuração, e mover o cálculo para uma camada de serviço/domínio.
+
+---
+
+#### 5. [LOW] `print()` como log e concatenação manual de strings
+
+**Onde:** espalhado — `controllers.py:8`, `:11`, `:57`, `:61`, `:106`, `:161`, `:179`, `:182`, `:208-210`, `:219`, `:248`, `:250`; `app.py:56`, `:83-86`; `database.py` (indireto).
+
+**Por que é relevante:** três problemas juntos no mesmo padrão. (a) `print()` não tem nível de severidade, timestamp nem destino configurável — em produção vai para o *stdout* e some; não dá para filtrar erro de informação. (b) A concatenação `"texto " + str(x)` é verbosa e frágil comparada a f-strings, e aparece em ~20 lugares. (c) Vários desses `print` estão **logando dado sensível ou substituindo funcionalidade**: `controllers.py:161` e `:179` registram o e-mail do usuário em log de texto puro, e `controllers.py:208-210` usa `print("ENVIANDO EMAIL: ...")` no lugar de um disparo real de notificação — um efeito colateral de negócio que nunca acontece, disfarçado de log.
+
+Na mesma linha de legibilidade: o parâmetro `id` (`controllers.py:14`, `models.py:24`) sombreia a *builtin* `id()` do Python, e `models.py:2` importa `sqlite3` sem usar.
+
+**Correção esperada:** substituir `print` pelo módulo `logging` com níveis apropriados, adotar f-strings, remover dado pessoal dos logs, e extrair as notificações para um serviço próprio (mesmo que *stub*) em vez de deixá-las como texto impresso no controller.
+
+---
+
+**Resumo do projeto 1**
+
+| # | Severidade | Problema | Arquivo principal |
+|---|---|---|---|
+| 1 | CRITICAL | SQL Injection por concatenação de string (+ `/admin/query` aberto, senha em texto puro, `SECRET_KEY` exposta no `/health`) | `models.py`, `app.py`, `controllers.py` |
+| 2 | MEDIUM | Query N+1 em dois níveis na listagem de pedidos, sem paginação nem índices | `models.py` |
+| 3 | MEDIUM | Validação duplicada (e já divergente) entre `criar`/`atualizar` + serialização repetida 3× | `controllers.py`, `models.py` |
+| 4 | LOW | Magic numbers nas faixas de desconto | `models.py` |
+| 5 | LOW | `print()` como log, concatenação manual de strings, dado sensível em log | `controllers.py`, `app.py` |
