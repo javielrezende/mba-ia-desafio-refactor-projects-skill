@@ -648,3 +648,118 @@ No mesmo bloco: tudo é declarado com `let` mesmo nunca sendo reatribuído (deve
 | 3 | MEDIUM | Checkout sem transação, schema sem `FOREIGN KEY` e `DELETE` que gera órfãos | `AppManager.js` |
 | 4 | LOW | Variáveis de uma letra e abreviações inconsistentes no contrato da API (`usr`, `eml`, `c_id`) | `AppManager.js` |
 | 5 | LOW | `console.log` como log, código morto e export por valor de estado mutável | `utils.js` |
+
+---
+
+### Projeto 3 — `task-manager-api/` (Python/Flask — API de Task Manager)
+
+**Estrutura atual:** 17 arquivos distribuídos em `models/`, `routes/`, `services/` e `utils/`, com SQLAlchemy no lugar de SQL cru. É de longe o projeto mais organizado dos três — mas a separação é só de pastas: não existe camada de controller/service, então a regra de negócio mora dentro dos handlers HTTP dos blueprints, e as pastas `services/` e `utils/` estão praticamente mortas.
+
+---
+
+#### 1. [CRITICAL] Autenticação quebrada — MD5 sem salt, hash de senha devolvido no JSON e token falso
+
+**Onde:**
+- `models/user.py:29` — `self.password = hashlib.md5(pwd.encode()).hexdigest()`
+- `models/user.py:32` — `check_password` comparando o MD5 diretamente
+- `models/user.py:21` — `'password': self.password` dentro do `to_dict()`
+- `routes/user_routes.py:210` — `'token': 'fake-jwt-token-' + str(user.id)`
+- `app.py:13` — `SECRET_KEY = 'super-secret-key-123'`
+- `services/notification_service.py:7-10` — host, usuário e senha do SMTP hardcoded
+
+**Por que é relevante:** o `to_dict()` do `User` inclui o campo `password`, e esse mesmo `to_dict()` é a resposta de `GET /users/<id>` (`user_routes.py:33`), de `POST /users` (`:85`), de `PUT /users/<id>` (`:129`) e do próprio `POST /login` (`:209`). Ou seja, **qualquer pessoa que consulte um usuário recebe o hash da senha dele no JSON** — sem autenticação nenhuma, já que não há middleware de auth em lugar algum. E o hash é MD5 puro, sem salt: os hashes do seed (`seed.py:19,26,33` — senhas `1234`, `abcd`, `pass`) são quebrados por rainbow table em segundos. Duas senhas iguais geram o mesmo hash, então dá para inferir quem compartilha senha só olhando o JSON.
+
+O `/login` fecha o ciclo: devolve `'fake-jwt-token-' + user.id`, um token **previsível, sem assinatura e sem expiração**. Como nenhuma rota valida token, ele é decorativo — mas dá a falsa impressão de que existe autenticação. Na prática, `DELETE /users/1` e `PUT /users/1` (que permite mudar o próprio `role` para `admin`, `:119-122`) estão abertos para qualquer um. O método `is_admin()` (`models/user.py:34`) existe e nunca é chamado em nenhum lugar do projeto — não há uma única verificação de autorização.
+
+**Agravantes na mesma família:**
+- `app.py:13` — `SECRET_KEY` fixa no código; `app.py:34` — `debug=True` com `host='0.0.0.0'`, o que expõe o console interativo do Werkzeug na rede.
+- `app.py:15` — `CORS(app)` sem restrição de origem: qualquer site pode chamar a API a partir do navegador da vítima.
+- `services/notification_service.py:10` — `email_password = 'senha123'` versionada, no mesmo padrão do `config.php` commitado.
+- `user_routes.py:64` — senha mínima de 4 caracteres.
+- `user_routes.py:198-202` — o login responde 401 antes de checar a senha quando o e-mail não existe, permitindo enumerar contas válidas pelo tempo/ordem de resposta.
+
+**Correção esperada:** trocar MD5 por `bcrypt`/`argon2` com salt, remover `password` de qualquer serialização de saída (schema de resposta separado do model), emitir JWT assinado de verdade com expiração, adicionar middleware de autenticação/autorização nas rotas de escrita e mover `SECRET_KEY`, credenciais de SMTP e origens de CORS para variáveis de ambiente.
+
+---
+
+#### 2. [MEDIUM] Query N+1 na listagem de tasks e nos relatórios
+
+**Onde:**
+- `routes/task_routes.py:14` + `:42` + `:51` — `GET /tasks`
+- `routes/report_routes.py:53-56` — `GET /reports/summary`
+- `routes/report_routes.py:159-163` — `GET /categories`
+- `routes/user_routes.py:22` — `GET /users`
+
+**Por que é relevante:** o `GET /tasks` carrega todas as tasks e, dentro do loop, dispara `User.query.get(t.user_id)` (linha 42) e `Category.query.get(t.category_id)` (linha 51) para cada uma — `1 + 2N` queries para montar uma lista que um `joinedload` (ou um `JOIN`) resolveria em uma. Pior: os relacionamentos `task.user` e `task.category` **já estão declarados** em `models/task.py:20-21` e simplesmente não são usados; o código refaz à mão o que o ORM entregaria.
+
+O mesmo padrão se repete em três outros endpoints: o `/reports/summary` percorre todos os usuários e faz um `filter_by(user_id=...).all()` por usuário (linha 56) só para contar quantas estão concluídas — contagem que o banco faria com um `GROUP BY`; o `/categories` faz um `COUNT` por categoria dentro do loop (linha 163); e o `/users` acessa `len(u.tasks)` (linha 22), que dispara um `SELECT` lazy por usuário.
+
+Some-se a isso que **nenhum endpoint de listagem tem paginação ou `LIMIT`** (`/tasks`, `/users`, `/tasks/search`, `/reports/summary`): a resposta cresce junto com a tabela, sem teto. E há desperdício adicional em cima disso — o `/reports/summary` dispara 12 `COUNT` separados (linhas 15-28) onde dois `GROUP BY` bastariam, e depois ainda carrega **todas** as tasks em memória (linha 30) para contar as atrasadas em Python, algo que um `WHERE due_date < now()` faria no banco (mesmo padrão em `task_routes.py:281`).
+
+**Correção esperada:** usar `joinedload`/`selectinload` nos relacionamentos já declarados, trocar os loops de contagem por agregações `GROUP BY` no banco, filtrar as atrasadas via `WHERE` em vez de em memória e introduzir paginação em todas as listagens.
+
+---
+
+#### 3. [MEDIUM] Regra de negócio duplicada nos handlers — e as camadas `models`/`utils` existem mas não são usadas
+
+**Onde:**
+- Cálculo de "atrasada" copiado 6 vezes: `task_routes.py:30-39`, `task_routes.py:71-80`, `task_routes.py:283-287`, `user_routes.py:171-180`, `report_routes.py:34-43`, `report_routes.py:132-135` — enquanto `Task.is_overdue()` (`models/task.py:50-59`) faz exatamente isso e **nunca é chamado**.
+- Serialização manual da task refeita em `task_routes.py:17-28` e `user_routes.py:162-169`, apesar de `Task.to_dict()` (`models/task.py:23-36`) existir.
+- Validação de status/prioridade duplicada entre `create_task` (`task_routes.py:110-114`) e `update_task` (`task_routes.py:177-183`); os métodos `Task.validate_status()` e `Task.validate_priority()` (`models/task.py:38-48`) nunca são chamados.
+- `utils/helpers.py:57-108` — `process_task_data()`, uma **terceira** implementação completa da mesma validação, importada por ninguém.
+- Validação de e-mail com o mesmo regex copiado em `user_routes.py:61` e `:106`, enquanto `helpers.validate_email()` (`utils/helpers.py:19-23`) existe e não é usada.
+
+**Por que é relevante:** a mesma regra vive em até seis lugares, e as versões já divergem entre si — o `/tasks` e o `/users/<id>/tasks` devolvem o campo `overdue`, mas o `GET /tasks/search` (`task_routes.py:266-269`) usa `to_dict()` e **não devolve** `overdue` nenhum; o `to_dict()` do model, por sua vez, transforma `tags` em lista, enquanto o dict manual do `/tasks` faz o mesmo `split` copiado à mão (linha 28). Qualquer mudança na definição de "atrasada" — considerar fuso horário, incluir o status `blocked` — exige encontrar as seis cópias.
+
+Isso denuncia o problema arquitetural de fundo: **não existe camada de controller nem de service**. Os blueprints em `routes/` são simultaneamente roteamento, validação, regra de negócio e serialização; o `models/` guarda métodos de domínio que ninguém invoca; o `utils/helpers.py` é código morto quase inteiro (`format_date`, `calculate_percentage`, `sanitize_string`, `generate_id`, `log_action`, `is_valid_color`, `parse_date`, `process_task_data` — importados só parcialmente em `report_routes.py:7` e nunca chamados); e `services/notification_service.py` **não é importado por arquivo nenhum**, ou seja, a API nunca notifica ninguém apesar de ter um serviço de notificação pronto. A pasta sugere uma arquitetura que o código não pratica.
+
+**Correção esperada:** extrair controllers/services por domínio, deixar as rotas apenas com roteamento e serialização de resposta, centralizar a regra de "atrasada" em `Task.is_overdue()` (usado por todos), unificar a validação em um schema único reaproveitado por `POST` e `PUT`, e ou ligar o `NotificationService` ao fluxo de atribuição de task ou removê-lo.
+
+---
+
+#### 4. [LOW] Magic numbers espalhados — com as constantes já definidas e ignoradas
+
+**Onde:** `utils/helpers.py:110-116` define exatamente as constantes que faltam, e nenhuma é importada:
+
+```python
+VALID_STATUSES = ['pending', 'in_progress', 'done', 'cancelled']
+VALID_ROLES = ['user', 'admin', 'manager']
+MAX_TITLE_LENGTH = 200
+MIN_TITLE_LENGTH = 3
+MIN_PASSWORD_LENGTH = 4
+DEFAULT_PRIORITY = 3
+DEFAULT_COLOR = '#000000'
+```
+
+Enquanto isso, os literais aparecem soltos em: `task_routes.py:96,99` e `:167,169` (o `3` e o `200` do título), `task_routes.py:104,113` e `:182` (o `3` default e a faixa `1..5` de prioridade), `task_routes.py:110` e `:177` (a lista de status literal, duas vezes), `user_routes.py:64` e `:115` (o `4` da senha), `user_routes.py:71` e `:120` (a lista de roles literal, duas vezes), `report_routes.py:45` (`timedelta(days=7)`), `report_routes.py:129` (`if t.priority <= 2` definindo "alta prioridade" sem nome).
+
+**Por que é relevante:** o caso mais claro é `report_routes.py:83-89`, onde o relatório mapeia prioridade para `critical/high/medium/low/minimal` — a semântica dos números 1 a 5 existe, está documentada nesse dicionário, e em nenhum outro lugar do código. O `if t.priority <= 2` da linha 129 depende desse significado implícito: ninguém que leia só aquela linha sabe por que `2` é o corte. E como as regras estão duplicadas entre `POST` e `PUT` (problema 3), cada magic number tem duas cópias que podem divergir — mudar o limite do título para 300 exige lembrar de quatro lugares.
+
+**Correção esperada:** importar e usar as constantes que já existem (ou movê-las para um módulo de configuração/domínio), transformar status, role e prioridade em `Enum`, e nomear o corte de "alta prioridade".
+
+---
+
+#### 5. [LOW] `print()` como log, `except:` nu engolindo erros e imports não usados
+
+**Onde:**
+- `print()` como log: `task_routes.py:149`, `:219`, `:234`; `user_routes.py:83`, `:89`, `:147`; `services/notification_service.py:21,24`; `seed.py:93-96`. Existe um `helpers.log_action()` (`utils/helpers.py:36-41`) — que também é `print` — e nunca é chamado.
+- `except:` nu: `task_routes.py:62`, `:137`, `:204`, `:236`; `user_routes.py:130`, `:149`; `report_routes.py:186`, `:207`, `:221`; `utils/helpers.py:46,49,88`.
+- Imports mortos: `app.py:7` (`os, sys, json`), `task_routes.py:7` (`json, os, sys, time`), `user_routes.py:6` (`hashlib, json`), `report_routes.py:8` (`json`), `utils/helpers.py:3-7` (`os, json, sys, math, hashlib`).
+
+**Por que é relevante:** o `print` não tem nível, timestamp nem destino configurável — não dá para separar erro de informação nem desligar em produção. Mas o problema real é o `except:` nu: em `task_routes.py:62`, um `except:` envolve o handler inteiro do `GET /tasks` e devolve `{'error': 'Erro interno'}, 500` **sem registrar nada em lugar nenhum** — se a listagem quebrar, não existe stack trace, nem no log, nem na resposta. Um `except:` sem tipo também captura `KeyboardInterrupt` e `SystemExit`, o que atrapalha até o shutdown do processo. O mesmo padrão aparece em 11 lugares, e nos `try/except` de escrita (`report_routes.py:186,207,221`) o rollback acontece às cegas, sem distinguir violação de constraint de falha de conexão.
+
+Na mesma linha de legibilidade: `is_overdue()` (`models/task.py:50-59`), `is_admin()` (`models/user.py:34-38`) e `validate_status()` (`models/task.py:38-43`) usam `if/else` aninhados para devolver `True`/`False` onde uma expressão booleana direta bastaria; `type(tags) == list` (`task_routes.py:141`, `:210`) deveria ser `isinstance`; e `datetime.utcnow()` está deprecado desde o Python 3.12 (usado em ~15 lugares), devendo ser `datetime.now(timezone.utc)`.
+
+**Correção esperada:** substituir `print` pelo módulo `logging` com níveis, trocar todo `except:` por exceções específicas com log do stack trace, registrar um error handler central no Flask em vez de `try/except` por handler, remover os imports mortos e migrar `utcnow()` para a API com timezone.
+
+---
+
+**Resumo do projeto 3**
+
+| # | Severidade | Problema | Arquivo principal |
+|---|---|---|---|
+| 1 | CRITICAL | MD5 sem salt, hash de senha devolvido no JSON, token falso, `SECRET_KEY` e SMTP hardcoded, zero autorização | `models/user.py`, `routes/user_routes.py`, `app.py` |
+| 2 | MEDIUM | Query N+1 no `/tasks` e nos relatórios (relacionamentos declarados e não usados), sem paginação | `routes/task_routes.py`, `routes/report_routes.py` |
+| 3 | MEDIUM | Regra de "atrasada" duplicada 6× e validação 3×, com `models`/`utils`/`services` existindo mas nunca chamados | `routes/*.py`, `utils/helpers.py` |
+| 4 | LOW | Magic numbers de prioridade, título, senha e status — com as constantes já definidas e ignoradas | `utils/helpers.py`, `routes/task_routes.py` |
+| 5 | LOW | `print()` como log, `except:` nu sem registro de erro, imports mortos e `utcnow()` deprecado | `routes/*.py`, `utils/helpers.py` |
