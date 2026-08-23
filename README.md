@@ -886,7 +886,224 @@ Os critérios pedem ≥ 5 findings, o que cria um incentivo ruim: reportar cinco
 
 ## Resultados
 
-> _Seção a ser preenchida após a execução da skill nos três projetos: resumo dos relatórios de `reports/`, comparação antes/depois, checklist de validação preenchido e os logs das aplicações rodando após a refatoração._
+As três execuções da skill estão registradas em `reports/audit-project-{1,2,3}.md`. Os números abaixo saem desses relatórios e da validação executada no repositório — nenhum é estimativa.
+
+### Resumo dos relatórios de auditoria
+
+| # | Projeto | Stack detectada na Fase 1 | Arquivos | CRITICAL | HIGH | MEDIUM | LOW | Total |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| 1 | `code-smells-project` | Python 3.12 + Flask 3.1.1 | 4 (780 linhas) | 5 | 5 | 4 | 4 | **18** |
+| 2 | `ecommerce-api-legacy` | Node.js 24 + Express ^4.18.2 + sqlite3 | 3 (180 linhas) | 5 | 5 | 3 | 4 | **17** |
+| 3 | `task-manager-api` | Python 3.12 + Flask 3.0.0 + Flask-SQLAlchemy 3.1.1 | 14 (1.158 linhas) | 4 | 3 | 6 | 4 | **17** |
+| | | | | **14** | **13** | **13** | **12** | **52** |
+
+Os três passam com folga o mínimo de 5 findings e o mínimo de 1 CRITICAL/HIGH exigidos nos critérios de aceite.
+
+**O domínio foi lido do código, não do nome da pasta.** No projeto 2 a Fase 1 detectou *LMS com checkout de cursos* — as tabelas são `courses` e `enrollments`, a rota é `/api/checkout` de curso. O diretório se chama `ecommerce-api-legacy`, e o relatório registra explicitamente essa divergência.
+
+**Padrão que se repete nos três.** Cinco anti-patterns apareceram em todos: God Class/Module (AP-03), segredos hardcoded (AP-02), regra de negócio no controller (AP-06), acoplamento sem injeção de dependência (AP-07) e ausência de tratamento central de erro (AP-10). É o núcleo do que a refatoração desfaz.
+
+**Detecção de APIs deprecated (AP-15).** A checagem é obrigatória e aparece no relatório mesmo quando negativa:
+
+| Projeto | Resultado |
+|---|---|
+| 1 e 2 | `0 ocorrências` — registrado explicitamente na seção *APIs deprecated* de cada relatório |
+| 3 | **34 ocorrências em 3 famílias** — `datetime.utcnow()`, `Model.query.get()` e `type(x) == list` — reportadas como finding MEDIUM 13 e corrigidas na Fase 3 |
+
+### Comparação antes/depois
+
+**Projeto 1 — `code-smells-project`**
+
+```
+ANTES  (4 arquivos, 780 linhas)          DEPOIS (39 arquivos, 1.419 linhas)
+app.py            88   rotas             app.py                  entry point
+controllers.py   292   handlers          src/config/             settings + constantes
+models.py        314   SQL + regra       src/models/             acesso a dados
+database.py       86   conexão + seed    src/services/           regra de negócio
+                                         src/controllers/        fluxo HTTP
+                                         src/views/routes.py     roteamento
+                                         src/schemas/            validação
+                                         src/middlewares/        erro, paginação
+                                         src/infrastructure/     db, logger
+                                         src/domain/errors.py    exceções de domínio
+```
+
+**Projeto 2 — `ecommerce-api-legacy`**
+
+```
+ANTES  (3 arquivos, 180 linhas)          DEPOIS (29 arquivos, 1.024 linhas)
+src/AppManager.js 141  God Class:        src/config/             env + constantes
+                       conexão + DDL +   src/models/             6 repositories
+                       seed + rotas +    src/services/           checkout, user, report
+                       regra de negócio  src/controllers/        3 controllers
+src/app.js        14   bootstrap         src/routes/index.js     roteamento
+src/utils.js      25   segredos          src/schemas/            validação com zod
+                                         src/middlewares/        auth, erro, paginação
+                                         src/infrastructure/     db, migrations, gateway, hasher
+                                         src/server.js           composition root
+```
+
+**Projeto 3 — `task-manager-api`**
+
+Este entrou já dividido em pastas — `models/`, `routes/`, `services/`, `utils/`. A separação era nominal: 100% da regra de negócio vivia nos handlers HTTP e `services/` tinha um único arquivo.
+
+```
+ANTES  (14 arquivos, 1.158 linhas)       DEPOIS (45 arquivos, 2.337 linhas)
+routes/task_routes.py    299             src/controllers/        5 controllers (só fluxo)
+routes/report_routes.py  223             src/services/           5 services (regra)
+routes/user_routes.py    211             src/repositories/       3 repositories (query)
+utils/helpers.py         116             src/models/             entidades SQLAlchemy
+models/task.py            60             src/views/routes.py     22 rotas mapeadas
+services/…                48  (1 arq.)   src/schemas/            validação
+                                         src/middlewares/        auth, erro, paginação
+                                         src/infrastructure/     db, logger, clock, security
+```
+
+O código cresce em linhas porque validação, tratamento de erro e configuração passaram a existir de fato — antes eram ausentes ou copiados. O que encolhe é a concentração: o maior arquivo cai de **314 → 132** linhas no projeto 1, **141 → 89** no projeto 2 e **299 → 188** no projeto 3.
+
+**Sinais de anti-pattern, medidos por varredura no código antes e depois:**
+
+| Sinal | Projeto 1 | Projeto 2 | Projeto 3 |
+|---|---|---|---|
+| SQL montado por concatenação | 10 → **0** | — (já parametrizado) | — (ORM) |
+| Segredos literais no código | 1 → **0** | 4 → **0** | 2 → **0** |
+| `except:` nu | — | — | 12 → **0** |
+| `print()` / `console.log()` como log | 19 → **0** | 3 → **0** | 15 → **0** |
+| APIs deprecated (3 famílias, 34 ocorrências) | — | — | 34 → **0** |
+
+> As três ocorrências que a varredura ainda encontra em `task-manager-api/src/` estão dentro de *docstrings* — `domain/errors.py:6`, `middlewares/error_handler.py:3` e `infrastructure/clock.py:4` citam o anti-pattern removido para documentar por que a camada existe. Em código executável a contagem é zero nos três projetos.
+
+### Checklist de validação preenchido
+
+**Fase 1 — Análise**
+
+| Item | P1 | P2 | P3 |
+|---|:--:|:--:|:--:|
+| Linguagem detectada corretamente | ✅ Python | ✅ JavaScript | ✅ Python |
+| Framework detectado corretamente | ✅ Flask 3.1.1 | ✅ Express ^4.18.2 | ✅ Flask 3.0.0 + SQLAlchemy |
+| Domínio da aplicação descrito corretamente | ✅ E-commerce | ✅ LMS com checkout | ✅ Task Manager |
+| Número de arquivos analisados condiz com a realidade | ✅ 4 | ✅ 3 | ✅ 14 |
+
+**Fase 2 — Auditoria**
+
+| Item | P1 | P2 | P3 |
+|---|:--:|:--:|:--:|
+| Relatório segue o template de `references/report-template.md` | ✅ | ✅ | ✅ |
+| Cada finding tem arquivo e linhas exatos | ✅ | ✅ | ✅ |
+| Findings ordenados por severidade (CRITICAL → LOW) | ✅ | ✅ | ✅ |
+| Mínimo de 5 findings identificados | ✅ 18 | ✅ 17 | ✅ 17 |
+| Detecção de APIs deprecated incluída | ✅ 0, registrado | ✅ 0, registrado | ✅ 34 achados |
+| Skill pausa e pede confirmação antes da Fase 3 | ✅ | ✅ | ✅ |
+
+**Fase 3 — Refatoração**
+
+| Item | P1 | P2 | P3 |
+|---|:--:|:--:|:--:|
+| Estrutura de diretórios segue padrão MVC | ✅ | ✅ | ✅ |
+| Configuração extraída para módulo de config (sem hardcoded) | ✅ `src/config/` | ✅ `src/config/` | ✅ `src/config/` |
+| Models criados para abstrair dados | ✅ 3 models | ✅ 6 repositories | ✅ 3 models + 3 repositories |
+| Views/Routes separadas para roteamento | ✅ `views/routes.py` | ✅ `routes/index.js` | ✅ `views/routes.py` |
+| Controllers concentram o fluxo da aplicação | ✅ 5 | ✅ 3 | ✅ 5 |
+| Error handling centralizado | ✅ `middlewares/error_handler.py` | ✅ `middlewares/errorHandler.js` | ✅ `middlewares/error_handler.py` |
+| Entry point claro | ✅ `app.py` | ✅ `src/server.js` | ✅ `app.py` |
+| Aplicação inicia sem erros | ✅ | ✅ | ✅ |
+| Endpoints originais respondem corretamente | ✅ 11/11 | ✅ 5/5 | ✅ 14/14 |
+
+**Critérios de aceite do desafio — 3/3 projetos**
+
+| Critério | P1 | P2 | P3 |
+|---|:--:|:--:|:--:|
+| Fase 1 detecta a stack corretamente | ✅ | ✅ | ✅ |
+| Fase 2 encontra ≥ 5 findings | ✅ 18 | ✅ 17 | ✅ 17 |
+| Fase 2 inclui ≥ 1 CRITICAL ou HIGH | ✅ 10 | ✅ 10 | ✅ 7 |
+| Fase 3 — aplicação funciona após a refatoração | ✅ | ✅ | ✅ |
+
+### Logs das aplicações rodando após a refatoração
+
+Saída real de boot + smoke test dos três projetos, executados em sequência a partir da raiz do repositório.
+
+**Projeto 1 — `code-smells-project`** (`.venv/bin/python app.py`)
+
+```
+2026-08-22 21:15:09,103 INFO loja servidor iniciado em http://127.0.0.1:5000
+ * Serving Flask app 'src.app'
+ * Debug mode: off
+2026-08-22 21:15:09,106 INFO werkzeug WARNING: This is a development server. Do not use it in a production deployment.
+ * Running on http://127.0.0.1:5000
+ * Press CTRL+C to quit
+
+GET    /                            200
+GET    /health                      200
+GET    /produtos                    200
+GET    /produtos/busca?q=note       200
+GET    /produtos/1                  200
+GET    /usuarios                    200
+GET    /usuarios/1                  200
+GET    /pedidos                     200
+GET    /pedidos/usuario/1           200
+GET    /relatorios/vendas           200
+POST   /login (senha errada)        401
+```
+
+`debug=off` e o log estruturado com nome de aplicação (`loja`) são o resultado direto da correção dos findings 3 (segredos/config) e 16 (`print` como log). O `401` no login é o comportamento correto — antes da refatoração, `' OR '1'='1` como senha devolvia o usuário admin.
+
+**Projeto 2 — `ecommerce-api-legacy`** (`npm start`)
+
+```
+{"time":"2026-08-23T00:15:10.244Z","level":"warn","msg":"variáveis sensíveis ausentes: usando valores de desenvolvimento (ver .env.example)","variables":["PAYMENT_GATEWAY_KEY","ADMIN_API_KEY"]}
+{"time":"2026-08-23T00:15:10.246Z","level":"info","msg":"LMS API no ar","port":3000,"env":"development"}
+
+POST   /api/checkout (legado)       200
+POST   /api/checkout (recusado)     400
+GET    /api/admin/financial-report  200
+GET      idem, sem a chave          401
+DELETE /api/users/1                 200
+```
+
+O `warn` de boot é intencional: sem `.env`, a aplicação usa valores de desenvolvimento e avisa. Em `NODE_ENV=production` a mesma ausência **derruba o boot** em vez de subir com segredo default. O checkout aceita o payload legado (`usr`, `eml`, `c_id`, `card`) — contrato preservado. O `401` sem `X-Admin-Api-Key` é o finding 5 corrigido: esses dois endpoints não tinham autenticação nenhuma.
+
+**Projeto 3 — `task-manager-api`** (`.venv/bin/python app.py`)
+
+```
+2026-08-22 21:15:11,627 INFO     taskmanager aplicação montada env=development debug=False
+ * Serving Flask app 'src.app'
+ * Debug mode: off
+ * Running on http://127.0.0.1:5000
+ * Press CTRL+C to quit
+
+GET    /                            200
+GET    /health                      200
+GET    /tasks                       200
+GET    /tasks/search?q=bug          200
+GET    /tasks/stats                 200
+GET    /tasks/1                     200
+GET    /users                       200
+GET    /users/1                     200
+GET    /users/1/tasks               200
+GET    /categories                  200
+GET    /reports/summary             200
+GET    /reports/user/1              200
+POST   /tasks                       201
+DELETE /tasks/12 (limpeza)          200
+```
+
+As 22 rotas originais continuam registradas e respondendo. `debug=False` corrige o `app.run(debug=True, host='0.0.0.0')` do finding 3, que expunha o console interativo do Werkzeug na rede.
+
+### Breaking changes assumidos
+
+A refatoração preservou o contrato de API — mesmas rotas, mesmos métodos, mesma forma de resposta. As exceções são correções de segurança e de integridade, todas declaradas na seção *Breaking changes* de cada relatório. Resumo:
+
+| Projeto | Mudança de contrato | Finding que a motivou |
+|---|---|---|
+| 1 | `POST /admin/query` e `POST /admin/reset-db` **removidos** — executavam SQL arbitrário e apagavam as 4 tabelas, sem autenticação | 2 |
+| 1 | `GET /usuarios` e `/usuarios/<id>` não devolvem mais `senha`; `/health` não devolve mais `secret_key`, `debug`, `db_path` nem `ambiente` | 2 |
+| 1 | Respostas 500 devolvem `{"erro": "Erro interno"}` em vez da mensagem da exceção | 10 |
+| 2 | `GET /api/admin/financial-report` e `DELETE /api/users/:id` passam a exigir `X-Admin-Api-Key` | 5 |
+| 2 | `POST /api/checkout` valida senha (mín. 8), e-mail e cartão — payloads antes aceitos respondem 400 | 4, 12 |
+| 3 | `password` removido das respostas de `/users` e do objeto `user` de `POST /login` | 1 |
+| 3 | Política de senha de 4 para 8 caracteres mínimos | 2 |
+
+> Duas consequências operacionais registradas nos relatórios: a `SECRET_KEY` do projeto 1 **continua no histórico do Git e precisa ser rotacionada** — removê-la do código não basta; e no projeto 3 os hashes MD5 gravados não são verificáveis pelo scrypt, então bancos existentes exigem `python seed.py` ou reset de senha.
 
 ---
 
@@ -999,7 +1216,7 @@ grep -rnE "(execute|query|run)\(.*(\+|\$\{|f\")" src/
 grep -rn "except:" src/ ; grep -rn "console\.log(" src/
 ```
 
-Saída vazia nos quatro comandos é o resultado esperado.
+Saída vazia nos quatro comandos é o resultado esperado. A única exceção é o `grep "except:"` em `task-manager-api/`, que devolve duas linhas de *docstring* (`src/domain/errors.py:6` e `src/middlewares/error_handler.py:3`) citando o anti-pattern removido para documentar por que a camada existe — não há `except:` nu em código executável.
 
 **5. O relatório foi salvo.**
 

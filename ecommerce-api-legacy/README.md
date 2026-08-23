@@ -63,4 +63,4 @@ src/
 dublês, sem banco nem gateway reais.
 
 O relatório da auditoria que originou esta refatoração está em
-`reports/audit-ecommerce-api-legacy.md`, na raiz do repositório.
+`reports/audit-project-2.md`, na raiz do repositório.

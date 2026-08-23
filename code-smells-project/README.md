@@ -2,7 +2,7 @@
 
 API de E-commerce em Python/Flask usada como entrada do desafio `refactor-arch`.
 Refatorada para MVC em camadas — a auditoria que originou a mudança está em
-`reports/audit-code-smells-project.md`, na raiz do repositório.
+`reports/audit-project-1.md`, na raiz do repositório.
 
 ## Como rodar
 
