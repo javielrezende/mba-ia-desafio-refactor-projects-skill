@@ -162,6 +162,7 @@ _(preenchido ao fim da Fase 3 — ver abaixo)_
 
 - `GET /usuarios` não devolve mais o campo `senha`.
 - `POST /admin/query` removido (execução de SQL arbitrário sem autenticação).
+- `DELETE /usuarios/<id>` passa a exigir `Authorization: Bearer <token>` de administrador — sem token responde `401`, com token de usuário comum responde `403`. Clientes que chamavam a rota anonimamente precisam autenticar.
 ```
 
 ---
@@ -173,4 +174,5 @@ _(preenchido ao fim da Fase 3 — ver abaixo)_
 - Findings fora da ordem de severidade.
 - Ausência da linha/seção de APIs deprecated.
 - Marcar validação como ✅ sem ter executado o boot e as chamadas.
+- Marcar um finding de segurança como resolvido quando o controle existe mas está desligado nos defaults versionados — isso é finding **em aberto**, e a rota respondendo `200` sem credencial é a prova.
 - Inflar a contagem repetindo o mesmo achado em ocorrências separadas.

@@ -177,6 +177,91 @@ const hash = await bcrypt.hash(password, 12);
 
 Junto: middleware de autenticação nas rotas de escrita e verificação de autorização de fato chamada (`is_admin()` que existe precisa ser usada).
 
+### Exigir o token é breaking change — e é para ser feito assim mesmo
+
+O erro mais comum ao corrigir este anti-pattern é o meio-termo: construir a
+autenticação inteira e deixá-la desligada, para não quebrar os clientes.
+
+**Errado — o guard que não barra ninguém:**
+```python
+# config/settings.py
+AUTH_REQUIRED = _bool('AUTH_REQUIRED', 'false')   # default desligado
+
+# middlewares/auth.py
+def wrapper(*args, **kwargs):
+    payload = _current_payload()
+    if settings.AUTH_REQUIRED and not payload:    # <-- sem a flag, nunca levanta
+        raise UnauthorizedError()
+    return view(*args, **kwargs)
+```
+```
+# .env.example
+AUTH_REQUIRED=false   # "default false para preservar o contrato atual da API"
+```
+
+Com esses defaults, `DELETE /users/1` sem token responde `200` e apaga o usuário.
+O finding de autenticação quebrada **continua aberto** — o código só ganhou um
+decorator decorativo. Pior que não ter feito: quem revisa vê `@require_admin` na
+rota e assume que está protegida.
+
+**Certo — o guard vale sempre; o ambiente escolhe só o parâmetro:**
+```python
+# config/settings.py — nada de flag; o que vem do ambiente é a chave e o TTL
+SECRET_KEY = _required('SECRET_KEY')
+TOKEN_TTL_SECONDS = _int('TOKEN_TTL_SECONDS', 3600)
+
+# middlewares/auth.py
+def wrapper(*args, **kwargs):
+    payload = _current_payload()
+    if not payload:
+        raise UnauthorizedError('Autenticação obrigatória')
+    g.auth_payload = payload
+    return view(*args, **kwargs)
+```
+```js
+// mesma regra em Express: sem `if (config.authEnabled)` em volta do next(err)
+router.delete('/users/:id', requireAdmin, usersController.remove);
+```
+
+Depois decida o **escopo público** de forma explícita e curta — só o que precisa
+funcionar antes de existir um token:
+
+| Rota | Por quê |
+|---|---|
+| `POST /login` | emite o token; exigir token aqui é impossível |
+| `POST /users` (registro) | criar a primeira conta; o papel privilegiado continua exigindo admin |
+| `GET /health`, `GET /` | liveness probe de orquestrador, sem dado de negócio |
+
+Todo o resto exige credencial. Se o projeto tiver motivo real para manter alguma
+leitura aberta, esse motivo vai **escrito no relatório**, rota por rota — não em
+uma flag global.
+
+**Registre no relatório**, na mesma seção e com o mesmo peso da remoção do campo
+de senha:
+
+```
+### Breaking changes (correções de segurança)
+
+- Todas as rotas passam a exigir `Authorization: Bearer <token>`, exceto
+  `POST /login`, `POST /users`, `GET /health` e `GET /`. Chamadas sem token
+  respondem 401; com token de papel insuficiente, 403.
+```
+
+E **prove com a chamada**, nos defaults versionados, não com o código:
+
+```
+DELETE /users/2  sem token                 401
+DELETE /users/2  token de usuário comum    403
+DELETE /users/2  token de admin            200
+POST   /login    sem token                 200   (rota pública, segue aberta)
+```
+
+O raciocínio é o mesmo que já se aceita sem discussão para o campo `password`:
+remover `password` da resposta **também** quebra clientes que liam aquele campo,
+e ninguém propõe `RETURN_PASSWORD=true` para suavizar a transição. Autenticação
+não é diferente — o cliente que chamava `DELETE /users/<id>` anonimamente não é um
+contrato a preservar, é o próprio incidente.
+
 **Login sem enumeração de contas** — a mensagem uniforme não basta; o *tempo* também precisa ser:
 
 ```python

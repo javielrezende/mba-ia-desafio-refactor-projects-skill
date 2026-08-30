@@ -794,7 +794,7 @@ São restrições que, se violadas, invalidam a entrega inteira — por isso fic
 | Nenhuma escrita antes do `y` | O portão humano é requisito do desafio. Nas Fases 1 e 2 só são permitidas ferramentas de leitura — inclusive salvar o relatório em `reports/` só acontece depois da aprovação. |
 | Todo finding tem arquivo e linha reais | É o item do checklist mais fácil de falhar por alucinação. A regra manda descartar o achado que não foi localizado fisicamente. |
 | Nada de suposição de stack | Vale o manifesto e os imports, não o nome da pasta — ver o problema do `ecommerce-api-legacy` abaixo. |
-| Comportamento preservado | A Fase 3 não pode mudar contrato de API. As únicas exceções são correções de segurança, e cada uma precisa ser listada como *breaking change*. |
+| Comportamento preservado, menos onde preservá-lo é preservar a falha | A Fase 3 não pode mudar contrato de API — exceto por **correção de segurança, que é obrigatória e não opcional**: remover campo sensível da resposta, remover endpoint sem controle de acesso, **exigir autenticação em rota que hoje responde sem credencial**, endurecer validação insegura. Cada uma vai listada como *breaking change*. E a regra que fecha a brecha: **correção de segurança não fica atrás de flag desligada por default** — vale o comportamento com os defaults versionados, não o comportamento possível. |
 | Contagens vêm de comando executado | `Files: 4 analyzed` e `Total: 14 findings` saem de `wc -l`/`find` e da soma conferida, não de estimativa. |
 
 **3. Fase 2 com resposta ambígua = `n`.**
@@ -874,13 +874,32 @@ O `task-manager-api` já tem `models/`, `routes/`, `services/` e `utils/` — e 
 O diretório se chama `ecommerce-api-legacy` e o projeto é um LMS (cursos, matrículas, pagamentos). Se a Fase 1 inferir domínio pelo nome da pasta, todo o resto da auditoria herda o erro. Daí a regra 3 do `SKILL.md` e a instrução de cruzar três evidências — rotas, tabelas e `api.http`/README — com um aviso explícito sobre nomes enganosos.
 
 **4. Refatorar sem quebrar o contrato da API.**
-Vários anti-patterns só se corrigem mudando a interface pública: `usr`/`eml`/`c_id` são nomes ruins **e** são o payload que o consumidor envia; introduzir paginação muda uma resposta que hoje é um array puro. A skill separa os dois casos. Mudança de nomenclatura em payload público: aceitar os dois nomes por um período (`req.body.userName ?? req.body.usr`). Paginação: se o contrato original devolvia array, manter o array e enviar os metadados em headers (`X-Total-Count`). E as correções de segurança que **precisam** quebrar — remover o campo `senha` da resposta, remover o `POST /admin/query` — são permitidas, mas obrigadas a aparecer numa seção de *breaking changes* no fim da Fase 3.
+Vários anti-patterns só se corrigem mudando a interface pública: `usr`/`eml`/`c_id` são nomes ruins **e** são o payload que o consumidor envia; introduzir paginação muda uma resposta que hoje é um array puro. A skill separa os dois casos. Mudança de nomenclatura em payload público: aceitar os dois nomes por um período (`req.body.userName ?? req.body.usr`). Paginação: se o contrato original devolvia array, manter o array e enviar os metadados em headers (`X-Total-Count`). E as correções de segurança que **precisam** quebrar — remover o campo `senha` da resposta, remover o `POST /admin/query`, exigir autenticação onde hoje não há — não são apenas permitidas: são obrigatórias, e obrigadas a aparecer numa seção de *breaking changes* no fim da Fase 3. Foi exatamente aqui que a primeira entrega errou; ver o desafio 7.
 
 **5. Impedir validação declarada sem execução.**
 "✓ Application boots without errors" é uma linha barata de imprimir. A contramedida ficou em três pontos: a linha de base capturada antes da refatoração, a exigência de colar a **saída real** do boot e das chamadas no relatório (não parafrasear), e uma lista de "erros que invalidam o relatório" no `report-template.md`, onde consta marcar validação como ✅ sem ter executado boot e chamadas.
 
 **6. Contagem inflada como atalho para o critério de aceite.**
 Os critérios pedem ≥ 5 findings, o que cria um incentivo ruim: reportar cinco ocorrências do mesmo `print()`. Além da regra de agrupamento por raiz, o passo 8 da Fase 2 diz o que fazer quando o resultado ficou abaixo do mínimo — *não inventar achados*, e sim revisar as categorias marcadas como ausentes, porque uma varredura rasa é a causa muito mais provável que um projeto limpo.
+
+**7. A regra de preservar comportamento virou desculpa para não corrigir segurança.**
+Este foi um erro real da primeira entrega, apontado na devolutiva do instrutor, e é o desafio mais instrutivo dos sete — porque a skill funcionou como escrita, e o que estava errado era a regra.
+
+A redação original da regra 4 dizia que a Fase 3 não muda contrato, "com as únicas exceções permitidas" sendo correções de segurança. Duas palavras fizeram o estrago: *exceção* e *permitida*. Diante do finding de autenticação quebrada no `task-manager-api`, a Fase 3 leu a regra como um convite a minimizar o dano — construiu hash scrypt, JWT assinado, middleware, verificação de papel, e então embrulhou tudo em `if settings.AUTH_REQUIRED:` com o default `false`. O relatório registrou o finding como parcialmente resolvido e anexou a matriz de autorização rodada com `AUTH_REQUIRED=true`, que passava 8/8.
+
+Nos defaults versionados — que é o que qualquer um obtém ao clonar e rodar `python app.py` — o resultado era este:
+
+```
+$ curl -i -X DELETE http://127.0.0.1:5000/users/3      # sem header Authorization
+HTTP/1.1 200 OK
+{"message":"Usuário deletado com sucesso"}
+```
+
+O impacto descrito no próprio finding continuava valendo integralmente. Pior: agora havia um `@require_admin` na rota, o que faz a revisão seguinte presumir proteção e não testar a chamada. **Controle de segurança desligado por default é controle ausente com uma camada de disfarce.**
+
+O erro tem uma assinatura reconhecível: a mesma entrega removeu o campo `password` da resposta sem hesitar — quebrando qualquer cliente que lesse aquele campo — e ninguém propôs um `RETURN_PASSWORD=true` para suavizar a transição. As duas correções são da mesma natureza; só uma foi tratada como negociável. O projeto 2 confirma que a inconsistência era da regra e não da stack: lá o `X-Admin-Api-Key` passou a ser exigido incondicionalmente, sem flag, e isso foi registrado como breaking change sem discussão.
+
+A correção foi na skill, não no projeto — e só então o projeto foi reprocessado. O que mudou está detalhado em *Revisão pós-devolutiva*, mais abaixo.
 
 ---
 
@@ -948,7 +967,7 @@ src/utils.js      25   segredos          src/schemas/            validação com
 Este entrou já dividido em pastas — `models/`, `routes/`, `services/`, `utils/`. A separação era nominal: 100% da regra de negócio vivia nos handlers HTTP e `services/` tinha um único arquivo.
 
 ```
-ANTES  (14 arquivos, 1.158 linhas)       DEPOIS (45 arquivos, 2.337 linhas)
+ANTES  (14 arquivos, 1.158 linhas)       DEPOIS (35 arquivos com conteúdo, 2.388 linhas)
 routes/task_routes.py    299             src/controllers/        5 controllers (só fluxo)
 routes/report_routes.py  223             src/services/           5 services (regra)
 routes/user_routes.py    211             src/repositories/       3 repositories (query)
@@ -1100,10 +1119,83 @@ A refatoração preservou o contrato de API — mesmas rotas, mesmos métodos, m
 | 1 | Respostas 500 devolvem `{"erro": "Erro interno"}` em vez da mensagem da exceção | 10 |
 | 2 | `GET /api/admin/financial-report` e `DELETE /api/users/:id` passam a exigir `X-Admin-Api-Key` | 5 |
 | 2 | `POST /api/checkout` valida senha (mín. 8), e-mail e cartão — payloads antes aceitos respondem 400 | 4, 12 |
+| 3 | **Autenticação obrigatória em 18 das 22 rotas** — só `POST /login`, `POST /users`, `GET /` e `GET /health` respondem sem token. Sem token, `401`; com papel insuficiente, `403` | 2 |
 | 3 | `password` removido das respostas de `/users` e do objeto `user` de `POST /login` | 1 |
 | 3 | Política de senha de 4 para 8 caracteres mínimos | 2 |
 
 > Duas consequências operacionais registradas nos relatórios: a `SECRET_KEY` do projeto 1 **continua no histórico do Git e precisa ser rotacionada** — removê-la do código não basta; e no projeto 3 os hashes MD5 gravados não são verificáveis pelo scrypt, então bancos existentes exigem `python seed.py` ou reset de senha.
+
+---
+
+## Revisão pós-devolutiva
+
+A primeira entrega recebeu do instrutor uma devolutiva precisa:
+
+> A infraestrutura de autenticação que a Fase 3 construiu no `task-manager-api` está bem feita, mas fica desligada por padrão: `AUTH_REQUIRED=false` no `.env.example` e no `settings.py`, e todo guard do `auth.py` só barra quando essa flag está ligada, então o `DELETE /users/` segue aberto sem token, que é justamente o impacto do CRITICAL 2 do seu relatório. Ajuste a regra de preservação de comportamento e o playbook para tratar exigir autenticação como breaking change de segurança, igual você já fez com a remoção do campo de senha, e rode a skill de novo nesse projeto.
+
+O diagnóstico estava certo, inclusive na ordem das causas: **o defeito era da skill**, e o projeto era só onde ele aparecia. Por isso a revisão começou pela skill.
+
+### O que mudou na skill
+
+A skill é idêntica nas três cópias (`code-smells-project/`, `ecommerce-api-legacy/`, `task-manager-api/`); todas foram atualizadas.
+
+| Arquivo | Mudança |
+|---|---|
+| `SKILL.md` — regra 4 | *"Comportamento preservado"* → *"Comportamento preservado — **menos onde preservá-lo é preservar a falha**"*. A correção de segurança deixou de ser "exceção permitida" e virou obrigação, com a lista do que entra: remover campo sensível, remover endpoint sem controle, **exigir autenticação em rota que hoje responde sem credencial**, endurecer validação insegura. Um parágrafo novo proíbe nominalmente o padrão que causou o problema — `AUTH_REQUIRED=false`, `ENABLE_AUTH=0`, `if (config.authEnabled)` — e fecha com o paralelo que torna a regra difícil de contornar: remover `password` da resposta também quebra clientes, e ninguém propõe `RETURN_PASSWORD=true` |
+| `SKILL.md` — Fase 3, passo 5 | Recusa explícita de duas justificativas: *"resolver mudaria o contrato"* e *"o controle está implementado, basta ligar"*. Vale o comportamento com os defaults versionados, não o comportamento possível |
+| `SKILL.md` — Fase 3, passo 6 | Nova exigência de validação: provar controle de segurança **pela resposta**, com a app subida nos defaults versionados, chamando rota sensível sem credencial e rota privilegiada com credencial de menor privilégio, e colando os status obtidos |
+| `references/refactoring-playbook.md` — RP-04 | Seção nova de ~60 linhas: *"Exigir o token é breaking change — e é para ser feito assim mesmo"*. Traz o antes/depois do guard inerte contra o guard incondicional (em Python e em Express), a tabela do escopo público mínimo, o texto pronto da seção *Breaking changes* e o bloco de chamadas que serve de prova |
+| `references/antipattern-catalog.md` — AP-04 | Subseção *"Controle de acesso presente e desligado"*, com três greps de detecção (default no `.env`, default no módulo de config, guard dentro de `if` de configuração) e a instrução de classificar como **CRITICAL**, não como MEDIUM de configuração |
+| `references/architecture-guidelines.md` | *Defaults seguros* passou a incluir **autenticação exigida**, mais a regra geral: configuração escolhe *qual* segredo e *qual* TTL, nunca *se* a verificação acontece |
+| `references/report-template.md` | O exemplo de *Breaking changes* ganhou a exigência de token; a lista de *erros que invalidam o relatório* ganhou o item de marcar como resolvido um finding cujo controle está desligado nos defaults |
+
+### O que a skill reprocessada encontrou
+
+Rodada de novo no `task-manager-api`, a Fase 2 acusou o problema pelos greps novos — sete pontos: o default no `.env.example`, o default no `settings.py` e os cinco guards condicionados em `auth.py`. A confirmação veio da requisição real, com a aplicação nos defaults versionados: **as 22 rotas respondiam sem nenhuma credencial**, `DELETE /users/3` incluído.
+
+### O que mudou no projeto
+
+| Arquivo | Mudança |
+|---|---|
+| `src/config/settings.py` | `AUTH_REQUIRED` **removida** — não desligada, removida. Sobra `TOKEN_TTL_SECONDS`, que é parâmetro, não interruptor |
+| `.env.example` | A variável saiu; no lugar ficou o comentário que explica que autenticação não é opcional e quais são as rotas públicas |
+| `src/middlewares/auth.py` | Os cinco `if settings.AUTH_REQUIRED` sumiram. Sem nada configurável, os decorators pararam de receber `settings`, e a resolução de identidade foi concentrada em `_require_identity()` |
+| `src/views/routes.py` | As 10 rotas de leitura, antes abertas, passaram a exigir token. As 4 rotas públicas ficaram declaradas em `PUBLIC_ROUTES`, com o motivo de cada uma ao lado — a decisão passou a ser legível no código, em vez de implícita na ausência de decorator |
+| `src/app.py` | `build_blueprints(controllers, settings)` → `build_blueprints(controllers)` |
+| `task-manager-api/README.md` | Seção *Autenticação* reescrita: tabela das rotas públicas, exemplo de `curl` com token, e a nota de por que não existe flag |
+| `reports/audit-project-3.md` | Finding 2 passou de ⚠️ Parcial para ✅ Resolvido, com a evidência do antes e do depois; *Breaking changes* ganhou a exigência de autenticação como item 1; e a árvore de estrutura foi remedida com `wc -l` (trazia 2.171 linhas e 177 como maior arquivo; o real já era 2.337 e 188 antes desta rodada) |
+
+**Escopo escolhido: tudo autenticado, menos login, registro e liveness.** Exigir token só nas escritas fecharia o `DELETE /users/<id>` da devolutiva, mas deixaria `GET /users` entregando a lista de e-mails de todos os usuários e `GET /reports/summary` entregando a produtividade de cada um para qualquer anônimo — os dois estão citados no *Impacto* do finding 2. Parar nas escritas seria fechar o finding pela metade outra vez.
+
+### Antes e depois, medido
+
+Mesmo probe, mesma aplicação, sem nenhuma credencial:
+
+| | Antes | Depois |
+|---|---|---|
+| `GET /tasks` | 200 | **401** |
+| `GET /users` | 200 | **401** |
+| `GET /reports/summary` | 200 | **401** |
+| `POST /tasks` | 201 | **401** |
+| `PUT /users/1` | 200 | **401** |
+| **`DELETE /users/3`** | **200** | **401** |
+| `GET /` | 200 | 200 |
+| `GET /health` | 200 | 200 |
+| `POST /login` | 200 | 200 |
+| `POST /users` (registro) | 201 | 201 |
+
+18 rotas passaram a exigir token; as 4 públicas seguem abertas por decisão declarada.
+
+| Verificação da segunda execução | Resultado |
+|---|---|
+| Rotas protegidas sem token | ✅ 18/18 respondem `401` |
+| Rotas públicas sem token | ✅ 4/4 respondem normalmente |
+| Matriz de autorização | ✅ 17/17 — token ausente, adulterado, esquema errado, papel insuficiente, escalada de privilégio e caminhos permitidos |
+| Contrato preservado sob token válido | ✅ **26/26** idênticos em status e forma de resposta contra a versão anterior rodando em paralelo na porta 5001, sobre bancos recém-seedados idênticos |
+| Rotas registradas | ✅ 22 — as mesmas 22 |
+| Varredura dos greps novos do AP-04 | ✅ 0 ocorrências em código executável |
+
+A comparação lado a lado é o ponto que fecha a devolutiva: **dado um token válido, as duas versões respondem exatamente a mesma coisa em 26/26 casos** — leituras, escritas, `404`, `400` de validação, `401` de credencial inválida e paginação. A única diferença de comportamento é a exigência do header. É o que caracteriza a mudança como breaking change de segurança bem delimitado, e não como refatoração que alterou o contrato por descuido.
 
 ---
 
