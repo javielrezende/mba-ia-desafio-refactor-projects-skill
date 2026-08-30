@@ -104,7 +104,20 @@ O sinal é **estrutural, não textual**: o handler retorna 401 assim que não en
 
 Não confunda com o problema de mensagem distinta (`'Usuário não encontrado'` vs `'Senha incorreta'`), que é o caso óbvio: se as mensagens **já** são uniformes, isso está certo e não deve ser "corrigido" — o que falta é igualar o trabalho executado nos dois caminhos (comparar contra um hash dummy quando o usuário não existe). Correção em RP-04.
 
-**Por que CRITICAL:** MD5 sem salt cai por rainbow table em segundos e senhas iguais geram hashes iguais. Um token sem assinatura e sem expiração dá falsa impressão de autenticação onde não há nenhuma. Verifique também se existe alguma verificação de autorização: um método `is_admin()` definido e **nunca chamado** significa zero controle de acesso.
+**Controle de acesso presente e desligado** — o caso que passa despercebido em auditoria de código refatorado. O middleware existe, o decorator está aplicado na rota, o `is_admin()` é chamado — e nada disso barra ninguém, porque a verificação inteira está dentro de um `if` de configuração cujo default é desligado:
+
+```bash
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(auth|login|secur|guard|protect)[a-z_]*(required|enabled|on|active)\s*[:=]\s*(false|0|'false'|\"false\")" .
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "^\s*[A-Z_]*(AUTH|SECUR|GUARD)[A-Z_]*\s*=\s*(false|0|off|no)\s*$" .env* 2>/dev/null
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(getenv|environ\.get|_bool|boolean|env)\(\s*['\"][A-Z_]*(AUTH|SECUR|GUARD|PROTECT)[A-Z_]*['\"]\s*,\s*['\"]?(false|0|off|no)" .
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "if\s+\(?[a-z_.]*(settings|config|env)[a-z_.]*\.[A-Z_a-z]*(AUTH|auth)[A-Za-z_]*" .
+```
+
+Sinais: `AUTH_REQUIRED=false` no `.env.example`; `_bool('AUTH_REQUIRED', 'false')` no módulo de config; `if settings.AUTH_REQUIRED and not payload: raise Unauthorized` — ou seja, **sem** a flag o `raise` nunca acontece e o handler segue adiante; comentário do tipo *"desligado por default para não quebrar o contrato"*.
+
+Trate como **CRITICAL, não como MEDIUM de configuração**: o que importa é o comportamento com os defaults versionados, e com eles a rota destrutiva responde sem credencial. A severidade é a mesma de não ter middleware nenhum — a diferença é só que aqui o código *parece* protegido, o que é pior, porque a revisão seguinte confia no decorator e não testa a chamada. Confirme sempre com a requisição real: suba a app nos defaults e chame `DELETE`/`POST` sem token; `200` responde a pergunta.
+
+**Por que CRITICAL:** MD5 sem salt cai por rainbow table em segundos e senhas iguais geram hashes iguais. Um token sem assinatura e sem expiração dá falsa impressão de autenticação onde não há nenhuma. Verifique também se existe alguma verificação de autorização: um método `is_admin()` definido e **nunca chamado** significa zero controle de acesso — e um middleware de auth que existe mas está atrás de flag desligada é a mesma ausência, com uma camada de disfarce a mais.
 
 → Correção: **RP-04**
 

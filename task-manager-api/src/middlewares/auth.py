@@ -1,12 +1,23 @@
 """Middleware de autenticação e autorização.
 
 A API original não verificava token em nenhuma das 22 rotas e tinha um
-User.is_admin() definido e nunca chamado (finding 2 / AP-04). Aqui a verificação
-existe de fato e usa is_admin().
+`User.is_admin()` definido e nunca chamado (finding 2 / AP-04). Aqui a
+verificação existe e **vale sempre**.
 
-Fica desligada por default (AUTH_REQUIRED=false) porque exigir token quebraria
-os 22 endpoints existentes, muito além das duas breaking changes aprovadas.
-Basta AUTH_REQUIRED=true no .env para passar a exigir Authorization: Bearer.
+Não há flag. A primeira passagem desta refatoração construiu estes mesmos guards
+e os deixou dentro de `if settings.AUTH_REQUIRED:`, com o default `false` — o que
+mantinha `DELETE /users/<id>` aberto a qualquer um nos defaults versionados, isto
+é, deixava o finding 2 inteiramente em aberto por trás de código que *parecia*
+protegido. Exigir credencial é breaking change de segurança, da mesma família da
+remoção do campo `password` da resposta: quebra clientes, é registrado em
+*Breaking changes*, e é feito assim mesmo. Ver RP-04 no playbook da skill.
+
+O que o ambiente configura é o *parâmetro* da verificação (`SECRET_KEY`,
+`TOKEN_TTL_SECONDS`), nunca *se* ela acontece.
+
+Rotas públicas, e o motivo de cada uma — a lista completa está em views/routes.py:
+`POST /login` (emite o token), `POST /users` (registro; papel privilegiado segue
+exigindo admin), `GET /` e `GET /health` (liveness, sem dado de negócio).
 """
 from functools import wraps
 
@@ -24,49 +35,12 @@ def _current_payload():
     return decode_token(header[len('Bearer '):].strip())
 
 
-def require_auth(settings):
-    """Exige token válido quando settings.AUTH_REQUIRED estiver ligado."""
-
-    def decorator(view):
-        @wraps(view)
-        def wrapper(*args, **kwargs):
-            payload = _current_payload()
-            g.auth_payload = payload
-            if settings.AUTH_REQUIRED and not payload:
-                raise UnauthorizedError('Autenticação obrigatória')
-            return view(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-def require_admin(settings):
-    """Exige papel de administrador quando a autenticação está ligada."""
-
-    def decorator(view):
-        @wraps(view)
-        def wrapper(*args, **kwargs):
-            payload = _current_payload()
-            g.auth_payload = payload
-            if settings.AUTH_REQUIRED:
-                if not payload:
-                    raise UnauthorizedError('Autenticação obrigatória')
-                if payload.get('role') != 'admin':
-                    raise ForbiddenError('Requer privilégio de administrador')
-            return view(*args, **kwargs)
-
-        return wrapper
-
-    return decorator
-
-
-def _require_identity(settings):
-    """Resolve o chamador e exige token quando a autenticação está ligada."""
+def _require_identity():
+    """Resolve o chamador e exige token válido. Sem token, 401 — sem exceção."""
     payload = _current_payload()
-    g.auth_payload = payload
-    if settings.AUTH_REQUIRED and not payload:
+    if not payload:
         raise UnauthorizedError('Autenticação obrigatória')
+    g.auth_payload = payload
     return payload
 
 
@@ -74,7 +48,31 @@ def _is_admin(payload) -> bool:
     return bool(payload) and payload.get('role') == Role.ADMIN.value
 
 
-def require_self_or_admin(settings, param='user_id'):
+def require_auth(view):
+    """Exige token válido. Usado como decorator direto, sem argumentos."""
+
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        _require_identity()
+        return view(*args, **kwargs)
+
+    return wrapper
+
+
+def require_admin(view):
+    """Exige token válido de um administrador."""
+
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        payload = _require_identity()
+        if not _is_admin(payload):
+            raise ForbiddenError('Requer privilégio de administrador')
+        return view(*args, **kwargs)
+
+    return wrapper
+
+
+def require_self_or_admin(param='user_id'):
     """Restringe a alteração de um usuário ao próprio dono ou a um admin.
 
     Sem isso, qualquer chamador autenticado editava o registro de qualquer
@@ -84,11 +82,10 @@ def require_self_or_admin(settings, param='user_id'):
     def decorator(view):
         @wraps(view)
         def wrapper(*args, **kwargs):
-            payload = _require_identity(settings)
-            if settings.AUTH_REQUIRED:
-                target_id = kwargs.get(param)
-                if not _is_admin(payload) and payload.get('sub') != target_id:
-                    raise ForbiddenError('Só é possível alterar o próprio usuário')
+            payload = _require_identity()
+            target_id = kwargs.get(param)
+            if not _is_admin(payload) and payload.get('sub') != target_id:
+                raise ForbiddenError('Só é possível alterar o próprio usuário')
             return view(*args, **kwargs)
 
         return wrapper
@@ -96,7 +93,7 @@ def require_self_or_admin(settings, param='user_id'):
     return decorator
 
 
-def require_admin_for_role(settings, allow_default=False):
+def require_admin_for_role(allow_default=False):
     """Impede que um não-admin defina ou altere o campo `role`.
 
     Este era o vetor de escalada de privilégio: `PUT /users/<id>` com
@@ -105,24 +102,23 @@ def require_admin_for_role(settings, allow_default=False):
     `role` era válido, nunca *quem* podia defini-lo.
 
     `allow_default=True` (usado no registro) libera o papel padrão `user`, para
-    que a criação de conta comum siga aberta.
+    que a criação de conta comum siga sendo a única escrita pública da API.
     """
 
     def decorator(view):
         @wraps(view)
         def wrapper(*args, **kwargs):
-            if settings.AUTH_REQUIRED:
-                body = request.get_json(silent=True) or {}
-                requested_role = body.get('role')
-                privileged = requested_role is not None and not (
-                    allow_default and requested_role == Role.USER.value
-                )
-                if privileged:
-                    payload = _require_identity(settings)
-                    if not _is_admin(payload):
-                        raise ForbiddenError(
-                            'Apenas administradores podem definir o papel do usuário'
-                        )
+            body = request.get_json(silent=True) or {}
+            requested_role = body.get('role')
+            privileged = requested_role is not None and not (
+                allow_default and requested_role == Role.USER.value
+            )
+            if privileged:
+                payload = _require_identity()
+                if not _is_admin(payload):
+                    raise ForbiddenError(
+                        'Apenas administradores podem definir o papel do usuário'
+                    )
             return view(*args, **kwargs)
 
         return wrapper

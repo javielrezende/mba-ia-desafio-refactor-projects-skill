@@ -602,18 +602,18 @@ utils/
 └── helpers.py             116    2 de 9 símbolos importados, 0 chamados
 ```
 
-**Depois** — 35 arquivos com conteúdo, 2.171 linhas, maior arquivo com 177:
+**Depois** — 35 arquivos com conteúdo, 2.388 linhas, maior arquivo com 188:
 
 ```
 app.py                        16   entry point: create_app() + app.run()
-seed.py                      107
+seed.py                      110
 .env.example                        todas as variáveis suportadas
 .gitignore                          .env, instance/, *.db
 src/
-├── app.py                    86   composition root: monta e injeta
+├── app.py                    89   composition root: monta e injeta
 ├── config/
-│   ├── settings.py           76   configuração lida do ambiente
-│   └── constants.py          57   Status, Role, limites, thresholds
+│   ├── settings.py           76   configuração lida do ambiente (sem flag de auth)
+│   └── constants.py          77   Status, Role, Priority, limites, thresholds
 ├── domain/
 │   └── errors.py             67   exceções de domínio → status HTTP
 ├── infrastructure/
@@ -626,40 +626,47 @@ src/
 │   ├── user_model.py         48   entidade + set/check_password + is_admin
 │   └── category_model.py     23
 ├── repositories/
-│   ├── task_repository.py   177   eager loading + agregações GROUP BY
+│   ├── task_repository.py   188   eager loading + agregações GROUP BY
 │   ├── user_repository.py    33
 │   └── category_repository.py 30
 ├── services/
-│   ├── task_service.py      144   regra de negócio, sem HTTP
-│   ├── user_service.py      117   inclui autenticação sem enumeração
-│   ├── category_service.py   58
-│   ├── report_service.py    120
+│   ├── task_service.py      153   regra de negócio, sem HTTP
+│   ├── user_service.py      120   inclui autenticação sem enumeração
+│   ├── category_service.py   61
+│   ├── report_service.py    118
 │   └── notification_service.py 61  agora com 4 importadores
 ├── controllers/
-│   ├── task_controller.py    65   8 métodos
-│   ├── user_controller.py    34   8 métodos
-│   ├── category_controller.py 23
+│   ├── task_controller.py    68   8 métodos
+│   ├── user_controller.py    38   8 métodos
+│   ├── category_controller.py 25
 │   ├── report_controller.py  13
 │   └── health_controller.py  17
 ├── views/
-│   └── routes.py            108   22 rotas → controller, uma linha cada
+│   └── routes.py            178   22 rotas → controller + PUBLIC_ROUTES declaradas
 ├── schemas/
 │   ├── task_schema.py       127   marshmallow, compartilhado POST/PUT
 │   ├── user_schema.py        97
 │   └── category_schema.py    36
 └── middlewares/
     ├── error_handler.py      30   3 handlers centrais
-    ├── validation.py         57
-    ├── pagination.py         30
-    └── auth.py               60   require_auth / require_admin
+    ├── validation.py         66
+    ├── pagination.py         45
+    └── auth.py              126   require_auth / require_admin / require_self_or_admin
+                                   / require_admin_for_role — todos incondicionais
 ```
+
+> Os números desta árvore foram remedidos com `wc -l` na segunda execução da
+> skill. A versão anterior do relatório trazia 2.171 linhas e 177 como maior
+> arquivo, valores que já não batiam com o código entregue (eram 2.337 e 188
+> antes das mudanças desta rodada) — a árvore havia sido escrita a partir de um
+> estado intermediário e não foi remedida depois das correções pós-refatoração.
 
 ### Findings resolvidos
 
 | # | Sev. | Finding | Status | Onde foi resolvido |
 |---|---|---|---|---|
 | 1 | CRITICAL | Sensitive Data Exposure | ✅ Resolvido | `src/models/user_model.py:33-44` — `to_dict()` sem `password`; verificado nos 4 endpoints |
-| 2 | CRITICAL | Broken Authentication | ⚠️ Parcial | `src/infrastructure/security.py` — scrypt (Werkzeug) + JWT HS256 assinado com `exp`; `src/services/user_service.py` — hash dummy contra enumeração; `src/middlewares/auth.py` — `require_auth`, `require_admin`, `require_self_or_admin` e `require_admin_for_role`, usando `is_admin()`. Escalada de privilégio fechada (ver abaixo). **Enforcement desligado por default** — ver justificativa abaixo |
+| 2 | CRITICAL | Broken Authentication | ✅ Resolvido | `src/infrastructure/security.py` — scrypt (Werkzeug) + JWT HS256 assinado com `exp`; `src/services/user_service.py` — hash dummy contra enumeração; `src/middlewares/auth.py` — `require_auth`, `require_admin`, `require_self_or_admin` e `require_admin_for_role`, usando `is_admin()`, **sem flag e sempre ativos**; `src/views/routes.py` — 18 das 22 rotas exigem token, 4 públicas declaradas em `PUBLIC_ROUTES`. Escalada de privilégio fechada. Enforcement verificado por requisição: `DELETE /users/3` sem token = `401` (ver *Segunda execução da skill*) |
 | 3 | CRITICAL | Hardcoded Credentials | ✅ Resolvido | `src/config/settings.py` + `.env.example`; `DEBUG=false`, host `127.0.0.1`, CORS restrito; `SECRET_KEY` obrigatória em produção |
 | 4 | CRITICAL | God Module / God Method | ✅ Resolvido | 733 linhas de `routes/` viraram controllers (13-65 linhas), services, repositories e schemas; maior arquivo do projeto: 177 linhas |
 | 5 | HIGH | Business Logic in Controller | ✅ Resolvido | `src/services/` — 5 services sem `request`/`jsonify`; `is_overdue` e `completion_rate` com implementação única |
@@ -694,15 +701,17 @@ cima dessa assimetria. Corrigido com o parâmetro `reject_empty=False` em
 análise manual e não resolvida na primeira passagem: a validação conferia se o
 valor de `role` era válido, nunca *quem* podia defini-lo. Qualquer chamador
 promovia a si mesmo a `admin` e editava o registro de qualquer outro usuário.
-Corrigido com dois novos controles em `src/middlewares/auth.py`, sujeitos ao mesmo
-`AUTH_REQUIRED` do restante:
+Corrigido com dois novos controles em `src/middlewares/auth.py` — na época sujeitos
+ao mesmo `AUTH_REQUIRED` do restante, portanto igualmente inertes nos defaults;
+hoje incondicionais (ver *Segunda execução da skill*):
 
 - `require_self_or_admin` — alterar um usuário exige ser o próprio dono ou admin;
 - `require_admin_for_role` — definir ou alterar `role` exige admin; no registro
   (`POST /users`) o papel padrão `user` segue liberado, para não fechar a criação
   de conta comum.
 
-Comportamento medido com `AUTH_REQUIRED=true`:
+Comportamento medido na época com `AUTH_REQUIRED=true` — hoje é o comportamento
+padrão, sem flag nenhuma:
 
 ```
 maria promove a SI MESMA a admin                     403
@@ -743,32 +752,73 @@ registrada em *Breaking changes*.
 
 ---
 
-#### Justificativa do finding 2 (CRITICAL parcial)
+#### Finding 2 — resolvido na segunda execução da skill
 
-A autenticação foi construída por inteiro e **funciona** — hash scrypt salgado,
-JWT HS256 assinado com expiração, middleware que valida assinatura e papel. O que
-ficou desligado por default é a **exigência** do token, via `AUTH_REQUIRED=false`.
+A primeira execução construiu a autenticação inteira — scrypt salgado, JWT HS256
+assinado com expiração, middleware que valida assinatura e papel — e a deixou
+**desligada por default**, atrás de `AUTH_REQUIRED=false`. O raciocínio na época
+foi que exigir token quebraria as 22 rotas, indo além das duas breaking changes
+aprovadas.
 
-Motivo: ligar a exigência faria as 22 rotas passarem a responder 401 sem token, o
-que extrapola em muito as duas breaking changes aprovadas para esta refatoração.
-A regra de preservação de contrato e a correção completa deste finding entram em
-conflito direto, e a escolha foi preservar o contrato e deixar a correção a um
-comando de distância.
+**Esse raciocínio estava errado, e o finding permaneceu aberto.** Com os defaults
+versionados — que são o que qualquer um obtém ao clonar o repositório e rodar
+`python app.py` — todo guard era inerte:
 
-Comportamento medido com `AUTH_REQUIRED=true`:
-
-```
-GET    /tasks    (leitura, sem token)          200
-POST   /tasks    SEM token                     401
-DELETE /users/2  SEM token                     401
-POST   /tasks    COM token de admin            201
-POST   /tasks    com token ADULTERADO          401
-DELETE /users/2  com token de user comum       403
-DELETE /users/2  com token de ADMIN            200
+```python
+if settings.AUTH_REQUIRED and not payload:   # AUTH_REQUIRED=false -> nunca levanta
+    raise UnauthorizedError('Autenticação obrigatória')
 ```
 
-Para completar o finding, basta `AUTH_REQUIRED=true` no `.env` — assumindo que os
-clientes da API sejam atualizados para enviar o header.
+Medido na aplicação rodando, antes da correção:
+
+```
+usuarios antes: ['João Silva', 'Maria Santos', 'Pedro Oliveira']
+
+$ curl -i -X DELETE http://127.0.0.1:5000/users/3      # sem header Authorization
+HTTP/1.1 200 OK
+{"message":"Usuário deletado com sucesso"}
+
+usuarios depois: ['João Silva', 'Maria Santos']
+```
+
+O impacto descrito neste próprio finding — *"`DELETE /users/<id>`, `PUT /tasks/<id>`
+e `/reports/summary` eram executáveis por qualquer um com acesso à rede"* —
+continuava valendo palavra por palavra depois da refatoração. O que a refatoração
+entregou foi um `@require_admin` decorativo na rota, o que é **pior** do que não
+ter feito nada: a revisão seguinte lê o decorator e presume proteção.
+
+**Correção.** A flag foi removida do projeto — não desligada, removida. Os guards
+valem sempre; o ambiente configura apenas `SECRET_KEY` e `TOKEN_TTL_SECONDS`, ou
+seja, *qual* chave assina e por *quanto tempo* o token vale, nunca *se* a
+verificação acontece. A regra de preservação de comportamento da skill e o
+playbook (RP-04) foram corrigidos junto, para tratar "exigir autenticação" como
+breaking change de segurança de mesmo peso que a remoção do campo `password` —
+ver *Segunda execução da skill*, abaixo.
+
+Comportamento verificado depois da correção, nos defaults versionados:
+
+```
+--- autenticação ---
+GET /tasks           sem token                       401
+GET /tasks           token de user                   200
+GET /tasks           token ADULTERADO                401
+GET /tasks           esquema errado (Basic)          401
+--- autorização: DELETE /users ---
+DELETE /users/3      sem token                       401
+DELETE /users/3      token de user comum             403
+DELETE /users/3      token de ADMIN                  200
+--- autorização: escalada de privilégio ---
+PUT /users/2  maria promove a SI MESMA a admin       403
+PUT /users/1  maria edita OUTRO usuario              403
+PUT /users/2  maria edita o PROPRIO nome             200
+POST /users   anonimo registra-se como ADMIN         401
+POST /users   anonimo registra-se como user (aberto) 201
+PUT /users/2  admin promove maria a admin            200
+--- escritas de dominio com token valido ---
+POST /tasks         token de user                    201
+POST /categories    token de user                    201
+GET /reports/summary token de user                   200
+```
 
 #### Justificativa do finding 12 (MEDIUM parcial)
 
@@ -792,7 +842,9 @@ implementações lado a lado sobre bancos recém-seedados idênticos.
 | Endpoints de leitura (status + valores) | ✅ **22/22** idênticos |
 | Escritas e caminhos de erro (status + valores) | ✅ **36/36** idênticos |
 | Revalidação exaustiva pós-correções | ✅ **68/68** escrita/erro; **46/53** leitura (7 = corpo JSON de erro do framework, status idêntico) |
-| Autorização com `AUTH_REQUIRED=true` | ✅ 8/8 cenários de escalada de privilégio com o resultado esperado |
+| Autenticação exigida nos defaults versionados | ✅ 18/22 rotas respondem `401` sem token; as 4 públicas (`GET /`, `GET /health`, `POST /login`, `POST /users`) respondem normalmente |
+| Autorização | ✅ 17/17 cenários de autenticação e escalada de privilégio com o resultado esperado |
+| Contrato preservado sob token válido | ✅ **26/26** casos idênticos em status e forma de resposta contra a versão anterior rodando em paralelo na porta 5001 |
 | `X-Total-Count` | ✅ presente e correto nas 5 listagens, respeitando filtros |
 | Probe de 36 chamadas vs linha de base | ✅ 33/36 idênticas; 3 divergências = remoção de `password` (breaking change aprovado) |
 | Varredura final do catálogo | ✅ 0 anti-patterns CRITICAL/HIGH remanescentes |
@@ -907,18 +959,32 @@ INFO taskmanager notificação suprimida (SMTP_ENABLED=false) destino=joao@email
 
 ### Breaking changes
 
-Duas mudanças de contrato, ambas correções de segurança aprovadas antes da
-execução, mais uma consequência operacional:
+Três mudanças de contrato, todas correções de segurança, mais uma consequência
+operacional:
 
-1. **`password` removido das respostas.** `GET /users/<id>`, `POST /users`,
+1. **Autenticação obrigatória em 18 das 22 rotas.** Toda rota passa a exigir
+   `Authorization: Bearer <token>`, exceto `POST /login`, `POST /users` (registro),
+   `GET /` e `GET /health`. Sem token a resposta é `401`; com token de papel
+   insuficiente, `403`. `DELETE /users/<id>` exige papel de administrador e
+   `PUT /users/<id>` exige ser o próprio dono ou admin. Clientes que chamavam a
+   API anonimamente precisam obter um token em `POST /login` e enviá-lo no header.
+
+   Esta é a mudança de contrato mais larga da refatoração, e é a correção do
+   finding 2. Ela tem exatamente a mesma natureza da remoção do campo `password`
+   do item 2 abaixo: quebra quem dependia do comportamento inseguro, e é feita
+   assim mesmo, porque o comportamento anterior *era* a vulnerabilidade. Não há
+   variável de ambiente que a desligue — ver *Finding 2 — resolvido na segunda
+   execução da skill*.
+
+2. **`password` removido das respostas.** `GET /users/<id>`, `POST /users`,
    `PUT /users/<id>` e o objeto `user` de `POST /login` não devolvem mais o hash
    da senha. Clientes que liam esse campo deixam de recebê-lo.
 
-2. **Política de senha de 4 para 8 caracteres mínimos.** `POST /users` e
+3. **Política de senha de 4 para 8 caracteres mínimos.** `POST /users` e
    `PUT /users/<id>` passam a recusar com 400 senhas que antes eram aceitas. As
    senhas do seed mudaram de `1234`/`abcd`/`pass` para `senha1234`.
 
-3. **Bancos existentes exigem novo seed ou reset de senha.** Os hashes MD5
+4. **Bancos existentes exigem novo seed ou reset de senha.** Os hashes MD5
    gravados não são verificáveis pelo scrypt: nenhum usuário pré-existente
    consegue autenticar sem ter a senha regravada. Para o ambiente de
    desenvolvimento, `python seed.py` resolve.
@@ -935,3 +1001,131 @@ O `SECRET_KEY` (`super-secret-key-123`) e a credencial de SMTP (`senha123`)
 **continuam no histórico do Git**. Removê-los do código não os remove dos commits
 anteriores: os dois valores precisam ser considerados comprometidos e
 **rotacionados** na origem, não apenas substituídos por variáveis de ambiente.
+
+---
+
+## Segunda execução da skill
+
+A primeira entrega recebeu uma devolutiva certeira: a infraestrutura de
+autenticação estava bem construída, mas **desligada por default**
+(`AUTH_REQUIRED=false` no `.env.example` e no `settings.py`), com todo guard do
+`auth.py` barrando apenas quando a flag estivesse ligada. Resultado prático:
+`DELETE /users/<id>` seguia aberto sem token — exatamente o impacto descrito no
+CRITICAL 2 deste relatório, que o relatório dava como tratado.
+
+A causa não estava no projeto, estava na skill. Por isso a correção começou por
+ela, e só depois o projeto foi reprocessado.
+
+### O que mudou na skill
+
+| Arquivo | Mudança |
+|---|---|
+| `SKILL.md` — regra 4 | "Comportamento preservado" virou "**preservado, menos onde preservá-lo é preservar a falha**". A correção de segurança deixou de ser exceção tolerada e passou a ser obrigação, com a lista explícita do que entra — incluindo *exigir autenticação em rota que hoje responde sem credencial*. Um parágrafo novo proíbe nominalmente o padrão que causou o problema: **correção de segurança não fica atrás de flag desligada por default** (`AUTH_REQUIRED=false`, `ENABLE_AUTH=0`, `if (config.authEnabled)`) |
+| `SKILL.md` — Fase 3, passo 5 | Duas justificativas passaram a ser recusadas explicitamente: *"resolver mudaria o contrato"* e *"o controle está implementado, basta ligar"*. Vale o comportamento com os defaults versionados, não o comportamento possível |
+| `SKILL.md` — Fase 3, passo 6 | Nova exigência de validação: provar os controles **pela resposta**, chamando as rotas sensíveis sem credencial com a app subida nos defaults versionados, e colar os status |
+| `references/refactoring-playbook.md` — RP-04 | Seção nova, *"Exigir o token é breaking change — e é para ser feito assim mesmo"*: o antes/depois do guard inerte vs. o guard incondicional, a tabela de escopo público mínimo, o texto pronto para a seção *Breaking changes* e o paralelo com o campo `password` |
+| `references/antipattern-catalog.md` — AP-04 | Subseção *"Controle de acesso presente e desligado"*, com três greps de detecção e a instrução de tratar como CRITICAL, não como MEDIUM de configuração |
+| `references/architecture-guidelines.md` — Config | "Defaults seguros" passou a incluir **autenticação exigida**, e ganhou a regra: configuração escolhe *qual* segredo e *qual* TTL, nunca *se* a verificação acontece |
+| `references/report-template.md` | O exemplo de *Breaking changes* passou a incluir a exigência de token, e a lista de *erros que invalidam o relatório* ganhou o item: marcar como resolvido um finding de segurança cujo controle está desligado nos defaults |
+
+A skill é idêntica nos três projetos (`code-smells-project/`,
+`ecommerce-api-legacy/`, `task-manager-api/`) — as três cópias foram atualizadas.
+
+### Fase 2 da segunda execução — o que a detecção nova encontrou
+
+Os greps novos do AP-04 rodados contra o código então vigente:
+
+```
+$ grep -rniE "^\s*[A-Z_]*(AUTH|SECUR|GUARD)[A-Z_]*\s*=\s*(false|0|off|no)\s*$" .env.example
+.env.example:21:AUTH_REQUIRED=false
+
+$ grep -rniE "(getenv|environ\.get|_bool|boolean|env)\(\s*['\"][A-Z_]*(AUTH|SECUR|GUARD|PROTECT)['\"]..." .
+src/config/settings.py:52:    AUTH_REQUIRED = _bool('AUTH_REQUIRED', 'false')
+
+$ grep -rnE "if\s+\(?[a-z_.]*(settings|config|env)[a-z_.]*\.[A-Z_a-z]*(AUTH|auth)[A-Za-z_]*" .
+src/middlewares/auth.py:35:            if settings.AUTH_REQUIRED and not payload:
+src/middlewares/auth.py:52:            if settings.AUTH_REQUIRED:
+src/middlewares/auth.py:68:    if settings.AUTH_REQUIRED and not payload:
+src/middlewares/auth.py:88:            if settings.AUTH_REQUIRED:
+src/middlewares/auth.py:114:            if settings.AUTH_REQUIRED:
+```
+
+Sete pontos: o default no `.env.example`, o default no módulo de config e os
+cinco guards condicionados. Confirmado pela requisição real — as 22 rotas
+respondendo sem nenhuma credencial:
+
+```
+--- LEITURAS (sem token) ---          --- ESCRITAS (sem token) ---
+GET  /                     200        POST   /tasks           201
+GET  /health               200        PUT    /tasks/1         200
+GET  /tasks                200        DELETE /tasks/10        200
+GET  /tasks/search         200        POST   /categories      201
+GET  /tasks/stats          200        PUT    /categories/1    200
+GET  /tasks/1              200        DELETE /categories/4    200
+GET  /users                200        POST   /users           201
+GET  /users/1              200        PUT    /users/1         200
+GET  /users/1/tasks        200        POST   /login           200
+GET  /categories           200
+GET  /reports/summary      200        --- DESTRUTIVO ---
+GET  /reports/user/1       200        DELETE /users/3         200
+```
+
+### Fase 3 da segunda execução — o que mudou no projeto
+
+| Arquivo | Mudança |
+|---|---|
+| `src/config/settings.py` | `AUTH_REQUIRED` **removida**. Sobra `TOKEN_TTL_SECONDS`, que é parâmetro, não interruptor |
+| `.env.example` | A variável saiu, substituída pelo comentário que explica que a autenticação não é opcional e quais são as 4 rotas públicas |
+| `src/middlewares/auth.py` | Os cinco `if settings.AUTH_REQUIRED` sumiram; os guards valem sempre. Como nada mais era configurável, os decorators deixaram de receber `settings`: `require_auth` e `require_admin` viraram decorators diretos, e `require_self_or_admin`/`require_admin_for_role` mantêm só os próprios parâmetros. A lógica de identidade ficou num único `_require_identity()` |
+| `src/views/routes.py` | As 10 rotas de leitura, antes abertas, passaram a exigir token. As 4 rotas públicas ficaram declaradas em `PUBLIC_ROUTES`, com o motivo de cada uma escrito ao lado — a decisão passa a ser legível no código, em vez de implícita na ausência de decorator |
+| `src/app.py` | `build_blueprints(controllers, settings)` → `build_blueprints(controllers)`, já que `settings` virou parâmetro morto |
+| `README.md` do projeto | Seção *Autenticação* reescrita: tabela das rotas públicas, exemplo de `curl` com token e a nota de por que não existe flag |
+
+Escopo escolhido: **tudo autenticado, menos login, registro e liveness.** A
+alternativa mais conservadora — exigir token só nas escritas — fecharia o
+`DELETE /users/<id>` da devolutiva, mas deixaria `GET /users` devolvendo a lista
+de e-mails de todos os usuários e `GET /reports/summary` devolvendo a produtividade
+de cada um para qualquer anônimo. Os dois estão citados no *Impacto* do finding 2,
+então parar nas escritas seria fechar o finding pela metade de novo.
+
+### Validação da segunda execução
+
+Todas as chamadas abaixo foram executadas com a aplicação subida nos defaults
+versionados — sem `.env` local, exatamente o que se obtém clonando o repositório.
+
+| Verificação | Resultado |
+|---|---|
+| Aplicação sobe sem erro | ✅ `python app.py` — sem traceback, `Debug mode: off`, ligada em `127.0.0.1` |
+| Rotas registradas | ✅ 22 regras — as mesmas 22 de antes |
+| Rotas protegidas sem token | ✅ 18/18 respondem `401` |
+| Rotas públicas sem token | ✅ 4/4 respondem normalmente (`GET /` 200, `GET /health` 200, `POST /login` 200, `POST /users` 201) |
+| Matriz de autorização | ✅ 17/17 — token ausente, adulterado, esquema errado, papel insuficiente, escalada de privilégio e caminhos permitidos |
+| Contrato preservado sob token válido | ✅ **26/26** — status e forma de resposta idênticos à versão anterior rodando em paralelo na 5001, sobre bancos recém-seedados idênticos |
+| `X-Total-Count` | ✅ presente e correto nas 5 listagens |
+| `python seed.py` com `-W error::DeprecationWarning` | ✅ 3 usuários, 4 categorias, 10 tasks, sem warning |
+| Varredura final dos sinais novos do AP-04 | ✅ 0 ocorrências em código executável (resta 1 menção em docstring, que documenta por que a flag não existe) |
+| Imports mortos | ✅ nenhum novo (só os re-exports intencionais de `src/models/__init__.py`) |
+
+**Comparação lado a lado, versão anterior (5001, sem token) × atual (5000, com token):**
+
+```
+idênticas: 26/26   divergentes: 0
+```
+
+Os 26 casos cobrem as 14 leituras, as 8 escritas, os 4 caminhos de erro
+(`404` de recurso inexistente, `400` de validação, `401` de credencial inválida)
+e a paginação. A única diferença de comportamento entre as duas versões é a
+exigência do header — dado o token, a resposta é a mesma, campo a campo.
+
+**Corpo das respostas de negação:**
+
+```
+$ curl -X DELETE http://127.0.0.1:5000/users/3
+{"error":"Autenticação obrigatória"}
+
+$ curl -X DELETE http://127.0.0.1:5000/users/3 -H "Authorization: Bearer <token de user comum>"
+{"error":"Requer privilégio de administrador"}
+```
+
+Mesmo formato `{"error": ...}` do resto da API — a negação passa pelo error
+handler central, não por um `return` solto no middleware.

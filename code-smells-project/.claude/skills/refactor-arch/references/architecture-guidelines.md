@@ -58,7 +58,8 @@ O alvo é MVC em camadas, com dependências apontando sempre para dentro. As reg
 ### Config
 - Módulo único que lê variáveis de ambiente e expõe valores tipados.
 - Zero segredo literal no código. `.env.example` versionado com chaves e valores fake; `.env` no `.gitignore`.
-- Defaults seguros: `DEBUG=False`, CORS restrito, sem senha default.
+- Defaults seguros: `DEBUG=False`, CORS restrito, sem senha default, **autenticação exigida**.
+- Nenhuma flag desliga um controle de segurança. Configuração escolhe *qual* segredo, *qual* origem, *qual* TTL — nunca *se* a verificação acontece. Se você se pegou escrevendo `if settings.AUTH_REQUIRED:` em volta de um `raise Unauthorized`, o `if` é o bug: o guard vale sempre, e o que sobra em ambiente é só o parâmetro (chave de assinatura, tempo de expiração).
 
 ### Middlewares
 - **Error handler central** — captura exceção de domínio e não tratada, loga com stack trace, devolve corpo de erro padronizado. Nunca vaza stack trace na resposta.

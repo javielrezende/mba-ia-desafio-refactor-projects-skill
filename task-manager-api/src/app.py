@@ -77,7 +77,7 @@ def create_app(settings: Settings | None = None, clock=utc_now, notifier=None) -
         'health': HealthController(),
     }
 
-    for blueprint in build_blueprints(controllers, settings):
+    for blueprint in build_blueprints(controllers):
         app.register_blueprint(blueprint)
 
     register_error_handlers(app, logger)

@@ -60,13 +60,42 @@ chave efêmera é gerada por processo.
 
 `POST /login` devolve um JWT HS256 assinado, com expiração (`TOKEN_TTL_SECONDS`).
 
-A verificação do token é **opcional** e vem desligada. Com `AUTH_REQUIRED=true`:
+**A autenticação é obrigatória e não tem interruptor.** Todas as rotas exigem
+`Authorization: Bearer <token>`, exceto quatro:
 
-- as rotas de escrita exigem `Authorization: Bearer <token>`;
+| Rota pública | Por quê |
+|---|---|
+| `POST /login` | emite o token |
+| `POST /users` | registro de conta — mas só no papel padrão `user` |
+| `GET /` | liveness probe, sem dado de negócio |
+| `GET /health` | liveness probe, sem dado de negócio |
+
+Sem token, qualquer outra rota responde `401`. Com token de papel insuficiente,
+`403`. As regras de autorização:
+
 - `DELETE /users/<id>` exige papel de administrador;
 - `PUT /users/<id>` só é permitido ao próprio usuário ou a um administrador;
 - definir ou alterar o campo `role` exige um administrador — o registro por
-  `POST /users` continua aberto para o papel padrão `user`.
+  `POST /users` segue aberto para o papel padrão `user`.
+
+```bash
+# 1. obter o token
+TOKEN=$(curl -s -X POST http://localhost:5000/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"joao@email.com","password":"senha1234"}' | jq -r .token)
+
+# 2. usá-lo em qualquer rota
+curl http://localhost:5000/tasks -H "Authorization: Bearer $TOKEN"
+
+# sem o header: 401
+curl -i -X DELETE http://localhost:5000/users/3
+```
+
+> Não existe variável de ambiente que desligue a verificação. A versão anterior
+> deste projeto tinha um `AUTH_REQUIRED` com default `false`, e com ele
+> `DELETE /users/<id>` respondia `200` sem token nenhum — o controle existia no
+> código e estava ausente na prática. Configuração escolhe *qual* chave assina o
+> token e por *quanto tempo* ele vale, nunca *se* a verificação acontece.
 
 ## Paginação
 

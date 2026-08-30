@@ -46,10 +46,11 @@ class Settings:
 
     LOG_LEVEL = os.getenv('LOG_LEVEL', 'INFO').upper()
 
-    #: Quando True, as rotas de escrita exigem um token válido.
-    #: Default False para não quebrar o contrato dos 22 endpoints existentes;
-    #: ver "Breaking changes" no relatório de auditoria.
-    AUTH_REQUIRED = _bool('AUTH_REQUIRED', 'false')
+    #: Não existe flag de autenticação, de propósito. Configuração escolhe *qual*
+    #: chave assina o token e por *quanto tempo* ele vale — nunca *se* a
+    #: verificação acontece. A primeira passagem desta refatoração tinha um
+    #: AUTH_REQUIRED com default `false`, e com ele DELETE /users/<id> respondia
+    #: 200 sem token: o controle existia no código e estava ausente na prática.
     TOKEN_TTL_SECONDS = _int('TOKEN_TTL_SECONDS', 3600)
 
     SMTP_HOST = os.getenv('SMTP_HOST', 'localhost')
