@@ -7,6 +7,8 @@
 | **Domínio** | LMS com fluxo de checkout (usuários, cursos, matrículas, pagamentos, audit log) |
 | **Arquitetura anterior** | God Class — `AppManager` (141 linhas) concentrando conexão, DDL, seed, roteamento e regra de negócio |
 | **Arquivos analisados** | 3 (180 linhas) |
+| **Endpoints** | 3 rotas |
+| **Auth** | 0 de 3 rotas exigem credencial — nenhum middleware de autenticação no projeto |
 | **Data** | 2026-08-22 |
 | **Skill** | refactor-arch v1 |
 
@@ -614,6 +616,36 @@ Todos os findings CRITICAL e HIGH foram resolvidos.
 | Aplicação sobe sem erro | ✅ `npm start` — boot limpo, sem stack trace |
 | Endpoints originais respondem | ✅ 7/7 chamadas da linha de base com o mesmo status e a mesma forma de resposta |
 | Varredura final do catálogo | ✅ 0 anti-patterns CRITICAL/HIGH remanescentes |
+| Matriz de acesso | ✅ 3/3 rotas conferidas pela chamada; 0 rota sensível anônima |
+
+### Matriz de acesso por rota
+
+Conferida em 2026-09-01 com a aplicação nos **defaults versionados** (sem `.env`
+local — o `warn` de boot confirma que a chave usada é a de desenvolvimento).
+Uma linha por rota registrada em `src/routes/index.js`: **3 rotas, 3 linhas**.
+
+| Rota | Classe | Anônimo | Chave errada | Chave admin | Observação |
+|---|---|---|---|---|---|
+| `POST /api/checkout` | público | 200 | 200 | 200 | é a rota de matrícula + criação da conta do aluno: exigir credencial aqui impediria qualquer venda, do mesmo modo que `POST /users` num sistema com registro. Não devolve dado de terceiros e nem lista nada — cria o próprio registro do chamador |
+| `GET /api/admin/financial-report` | privilegiado | **401** | **401** | 200 | faturamento por curso e nome dos alunos pagantes |
+| `DELETE /api/users/:id` | privilegiado | **401** | **401** | 200 | remoção destrutiva, com cascata em matrículas e pagamentos |
+
+```
+POST   /api/checkout                anon=200 comKey=200
+GET    /api/admin/financial-report  anon=401 comKey=200
+DELETE /api/users/1                 anon=401 comKey=200
+GET    /api/admin/financial-report  (chave errada)  401
+DELETE /api/users/2                 (chave errada)  401
+
+$ curl -s localhost:3000/api/admin/financial-report
+Não autorizado
+```
+
+A comparação da chave é feita com `crypto.timingSafeEqual` (`middlewares/adminAuth.js`),
+depois de conferir o comprimento — não vaza o prefixo correto pelo tempo de resposta.
+Não existe variável que desligue o guard: `ADMIN_API_KEY` escolhe *qual* chave vale,
+e em `NODE_ENV=production` a ausência dela **derruba o boot** em vez de subir com o
+valor de desenvolvimento.
 
 **Comparação linha de base → refatorado** (saída real do `curl`):
 

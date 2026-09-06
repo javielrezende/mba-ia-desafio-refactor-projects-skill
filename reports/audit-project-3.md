@@ -8,6 +8,7 @@
 | **Arquitetura original** | Camadas por pasta, sem controller/service — `models/`, `routes/`, `services/`, `utils/` existiam, mas 100% da regra vivia nos handlers HTTP |
 | **Arquivos analisados** | 14 (1.158 linhas), sendo 1 seed e 3 `__init__` |
 | **Endpoints** | 22 rotas |
+| **Auth** | 0 de 22 rotas exigem credencial — o `/login` devolve `'fake-jwt-token-' + id`, que nenhuma rota valida |
 | **Data** | 2026-08-22 |
 | **Skill** | refactor-arch v1 |
 
@@ -1105,6 +1106,69 @@ versionados — sem `.env` local, exatamente o que se obtém clonando o reposit�
 | `python seed.py` com `-W error::DeprecationWarning` | ✅ 3 usuários, 4 categorias, 10 tasks, sem warning |
 | Varredura final dos sinais novos do AP-04 | ✅ 0 ocorrências em código executável (resta 1 menção em docstring, que documenta por que a flag não existe) |
 | Imports mortos | ✅ nenhum novo (só os re-exports intencionais de `src/models/__init__.py`) |
+
+### Matriz de acesso por rota
+
+Uma linha por rota registrada — **22 rotas, 22 linhas**, o mesmo número que
+`src/views/routes.py` mapeia. Reconferida em 2026-09-01 com a aplicação nos
+defaults versionados e três credenciais: nenhuma, `maria@email.com` (papel `user`,
+id 2) e `joao@email.com` (papel `admin`).
+
+| Rota | Classe | Anônimo | User | Admin | Observação |
+|---|---|---|---|---|---|
+| `GET /` | público | 200 | 200 | 200 | liveness, sem dado de negócio |
+| `GET /health` | público | 200 | 200 | 200 | liveness, sem dado de negócio |
+| `POST /login` | público | 200 | 200 | 200 | emite o token |
+| `POST /users` | público | 201 | 201 | 201 | registro; `role` privilegiado exige admin |
+| `GET /tasks` | autenticado | **401** | 200 | 200 | |
+| `GET /tasks/search` | autenticado | **401** | 200 | 200 | |
+| `GET /tasks/stats` | autenticado | **401** | 200 | 200 | |
+| `GET /tasks/<id>` | autenticado | **401** | 200 | 200 | |
+| `POST /tasks` | autenticado | **401** | 201 | 201 | |
+| `PUT /tasks/<id>` | autenticado | **401** | 200 | 200 | |
+| `DELETE /tasks/<id>` | autenticado | **401** | 404 (inexistente) | 404 (inexistente) | o `401` anônimo vem antes da busca |
+| `GET /users` | autenticado | **401** | 200 | 200 | `password` fora da serialização |
+| `GET /users/<id>` | autenticado | **401** | 200 | 200 | |
+| `GET /users/<id>/tasks` | autenticado | **401** | 200 | 200 | |
+| `PUT /users/<id>` | dono ou admin | **401** | 200 (próprio) / **403** (outro) | 200 | `role` no corpo exige admin |
+| `DELETE /users/<id>` | admin | **401** | **403** | 404 (inexistente) | rota da primeira devolutiva |
+| `GET /categories` | autenticado | **401** | 200 | 200 | |
+| `POST /categories` | autenticado | **401** | 201 | 201 | |
+| `PUT /categories/<id>` | autenticado | **401** | 200 | 200 | |
+| `DELETE /categories/<id>` | autenticado | **401** | 404 (inexistente) | 404 (inexistente) | |
+| `GET /reports/summary` | autenticado | **401** | 200 | 200 | produtividade por usuário |
+| `GET /reports/user/<id>` | autenticado | **401** | 200 | 200 | |
+
+Saída real da varredura:
+
+```
+GET /                              anon=200 user=200 admin=200
+GET /health                        anon=200 user=200 admin=200
+GET /tasks                         anon=401 user=200 admin=200
+GET /tasks/search?q=a              anon=401 user=200 admin=200
+GET /tasks/stats                   anon=401 user=200 admin=200
+GET /tasks/1                       anon=401 user=200 admin=200
+POST /tasks                        anon=401 user=201 admin=201
+PUT /tasks/1                       anon=401 user=200 admin=200
+DELETE /tasks/99                   anon=401 user=404 admin=404
+GET /users                         anon=401 user=200 admin=200
+GET /users/2                       anon=401 user=200 admin=200
+GET /users/2/tasks                 anon=401 user=200 admin=200
+POST /users                        anon=201 user=201 admin=201
+PUT /users/2                       anon=401 user=200 admin=200
+DELETE /users/99                   anon=401 user=403 admin=404
+POST /login                        anon=200 user=200 admin=200
+GET /categories                    anon=401 user=200 admin=200
+POST /categories                   anon=401 user=201 admin=201
+PUT /categories/1                  anon=401 user=200 admin=200
+DELETE /categories/99              anon=401 user=404 admin=404
+GET /reports/summary               anon=401 user=200 admin=200
+GET /reports/user/2                anon=401 user=200 admin=200
+```
+
+`DELETE /users/99` devolve `403` para o usuário comum e `404` para o admin: a
+autorização é avaliada antes da busca, então o não-admin nem descobre se o id
+existe.
 
 **Comparação lado a lado, versão anterior (5001, sem token) × atual (5000, com token):**
 

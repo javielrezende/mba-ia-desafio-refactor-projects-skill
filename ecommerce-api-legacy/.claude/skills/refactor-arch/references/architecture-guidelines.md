@@ -64,6 +64,7 @@ O alvo é MVC em camadas, com dependências apontando sempre para dentro. As reg
 ### Middlewares
 - **Error handler central** — captura exceção de domínio e não tratada, loga com stack trace, devolve corpo de erro padronizado. Nunca vaza stack trace na resposta.
 - **Validação** — schema por endpoint, aplicado antes do controller.
+- **Autenticação/autorização** — guard aplicado no mapeamento da rota (`views/`/`routes/`), nunca dentro do controller nem do service. Deny-by-default: o padrão é exigir credencial, e as rotas públicas são uma lista curta, nomeada e justificada no próprio arquivo de rotas. Se o projeto legado não tinha esta camada, ela é **criada** — a ausência não é um contrato a preservar. Ver RP-17.
 - **Logging** — logger estruturado com nível; `print`/`console.log` não são log.
 
 ### Entry point / composition root
@@ -163,6 +164,10 @@ Cada item precisa ser verificável no código novo:
 [ ] Routes/Views só mapeiam rota → controller
 [ ] Error handler central registrado; nenhum except nu / catch vazio
 [ ] Middleware de validação nas rotas de escrita
+[ ] Middleware de autenticação existe e é aplicado no mapeamento das rotas
+[ ] Toda rota está classificada em público / autenticado / privilegiado, e a lista de públicas está escrita no arquivo de rotas
+[ ] Nenhuma rota de relatório, faturamento, listagem de usuários ou escrita responde sem credencial
+[ ] Nenhuma flag de ambiente desliga o guard (grep por AUTH_REQUIRED / ENABLE_AUTH limpo)
 [ ] Entry point único constrói e injeta as dependências
 [ ] Nenhum módulo instancia a própria conexão de banco
 [ ] Nenhum estado global mutável
@@ -191,6 +196,24 @@ curl -s -X POST http://localhost:3000/api/checkout \
   -H 'Content-Type: application/json' \
   -d '{"usr":"Guilherme","eml":"gui@x.com","pwd":"senhaforte","c_id":2,"card":"4111222233334444"}'
 ```
+
+**Matriz de acesso — obrigatória quando existe gate de autenticação (RP-17).** Uma linha por rota registrada, sem omitir nenhuma:
+
+```bash
+TOKEN_ADMIN=$(curl -s -X POST localhost:5000/login -H 'Content-Type: application/json' \
+  -d '{"email":"admin@loja.com","senha":"admin123"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+TOKEN_CLIENTE=$(curl -s -X POST localhost:5000/login -H 'Content-Type: application/json' \
+  -d '{"email":"joao@email.com","senha":"123456"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+for rota in /produtos /usuarios /pedidos /relatorios/vendas; do
+  printf '%-22s anon=%s cliente=%s admin=%s\n' "$rota" \
+    "$(curl -s -o /dev/null -w '%{http_code}' localhost:5000$rota)" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN_CLIENTE" localhost:5000$rota)" \
+    "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $TOKEN_ADMIN" localhost:5000$rota)"
+done
+```
+
+Confira o resultado contra o inventário: `401` onde o esperado é credencial, `403` onde o esperado é privilégio, `200` só nas públicas e nas autorizadas. Um `200` anônimo em rota classificada como autenticada invalida a validação inteira, por mais verde que esteja o resto.
 
 - Enumere os endpoints a partir das rotas registradas; se o projeto tem `api.http`/`*.rest`/coleção Postman, use os payloads de lá.
 - Compare **status** e **forma da resposta** (chaves do JSON), não valores voláteis (ids autoincrementais, timestamps).

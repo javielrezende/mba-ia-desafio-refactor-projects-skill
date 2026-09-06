@@ -16,7 +16,7 @@ Você é um arquiteto de software auditando um projeto legado. Sua entrega são 
 
    - remover campo sensível da resposta (senha, hash, token, segredo, flag de configuração);
    - remover endpoint que executa SQL arbitrário ou destrói dados sem controle de acesso;
-   - **exigir autenticação e autorização em rota que hoje responde sem credencial** — inclusive quando isso faz endpoints que devolviam `200` passarem a devolver `401`/`403`;
+   - **exigir autenticação e autorização em rota que hoje responde sem credencial** — inclusive quando isso faz endpoints que devolviam `200` passarem a devolver `401`/`403`, e inclusive quando o projeto legado **não tem mecanismo de autenticação nenhum**: nesse caso o gate é construído do zero (emissão de token no login + middleware de verificação), não dispensado por não existir;
    - endurecer política de senha e validação de entrada que hoje aceita valor inseguro.
 
    **Uma correção de segurança nunca fica atrás de uma flag desligada por default.** Construir o middleware de autenticação e deixá-lo inerte com `AUTH_REQUIRED=false`, `ENABLE_AUTH=0`, `if (config.authEnabled)` ou equivalente **não** resolve o finding — o endpoint continua aberto com os defaults versionados, e o relatório passa a mentir ao marcar o item como tratado. Se a exigência de credencial é a correção, ela entra **ligada**: sem flag, ou com uma flag que só existe para aumentar o rigor, nunca para removê-lo. O custo para os clientes da API é real e é registrado em *Breaking changes* — exatamente como a remoção do campo de senha, que também quebra quem lia aquele campo e mesmo assim é feita.
@@ -85,19 +85,30 @@ Só execute após o `y`.
    3. `services/` — regra de negócio pura, sem `request`/`response`.
    4. `controllers/` — orquestram: recebem entrada validada, chamam service, devolvem resposta. Sem SQL, sem regra de negócio.
    5. `views/` ou `routes/` — apenas mapeamento rota → controller, mais middleware de validação.
-   6. `middlewares/` — error handler central, validação, logging.
+   6. `middlewares/` — error handler central, validação, logging **e o gate de autenticação/autorização do passo 5**.
    7. Entry point / composition root — monta as dependências e injeta; nenhum módulo instancia a própria conexão de banco.
-5. Corrija os findings da Fase 2 conforme o playbook. Todo finding CRITICAL ou HIGH deve estar resolvido ou, se não puder ser, explicitamente justificado no resumo final. Duas justificativas **não** são aceitas:
+5. **Instale o gate de autenticação — passo obrigatório, não condicional.** Aplique **RP-17** sempre que a Fase 2 tiver registrado AP-04 ou AP-05, ou sempre que existir rota que leia/escreva dado de negócio sem credencial. Vale igualmente para os três casos, sem meio-termo entre eles:
+
+   | Estado do projeto legado | O que a Fase 3 entrega |
+   |---|---|
+   | Tem token e middleware, mas rota aberta ou flag desligada | Liga o guard, sem flag, e cobre as rotas descobertas |
+   | Tem login que devolve o usuário e nada mais | **Cria** a emissão de token no login e o middleware; o login passa a devolver credencial de verdade |
+   | Não tem nem login | Cria o mecanismo mínimo (hash + emissão + verificação) antes de fechar as rotas |
+
+   Faça o inventário **de todas as rotas**, uma por linha, e classifique cada uma em `público` / `autenticado` / `privilegiado`. Deny-by-default: uma rota só fica pública se estiver na lista curta justificada de RP-17 (emissão de token, registro da primeira conta, liveness) — e a justificativa vai escrita no relatório, rota por rota. Rota de relatório, faturamento, listagem de usuários, listagem global e escrita **nunca** é pública. Remover um endpoint administrativo perigoso (`/admin/query`, `reset-db`) **não** substitui este passo: as demais rotas sensíveis seguem abertas enquanto o gate não existir.
+6. Corrija os findings da Fase 2 conforme o playbook. Todo finding CRITICAL ou HIGH deve estar resolvido ou, se não puder ser, explicitamente justificado no resumo final. Um finding só é **Resolvido** quando **cada consequência descrita no próprio campo *Impacto*** deixou de ser possível — releia o texto que você escreveu na Fase 2 e teste, uma a uma, as frases dele. Se o Impacto diz *"qualquer anônimo lê o relatório de faturamento"*, o finding continua aberto enquanto `GET /relatorios/vendas` responder `200` sem credencial, por mais que o hash de senha e o endpoint de SQL arbitrário já tenham sido tratados. Três justificativas **não** são aceitas:
    - *"resolver mudaria o contrato"* — para finding de segurança, a regra 4 manda mudar o contrato e registrar o breaking change;
-   - *"o controle está implementado, basta ligar"* — vale o comportamento com os defaults versionados (`.env.example`, valores default do módulo de config), não o comportamento possível em alguma configuração. Controle desligado é controle ausente.
-6. **Valide:**
+   - *"o controle está implementado, basta ligar"* — vale o comportamento com os defaults versionados (`.env.example`, valores default do módulo de config), não o comportamento possível em alguma configuração. Controle desligado é controle ausente;
+   - *"o projeto não tinha autenticação, então não havia o que consertar"* — ausência total de controle de acesso é a forma mais grave do finding, não a sua dispensa. Ver o passo 5.
+7. **Valide:**
    - a aplicação sobe sem erro (execute o comando de boot da stack e leia o log);
    - cada endpoint da linha de base responde com o mesmo status e a mesma forma de resposta (use `curl`, o `api.http` do projeto, ou os testes existentes);
    - rode uma varredura final dos sinais do catálogo e confirme que os anti-patterns tratados não reaparecem no código novo;
    - **prove os controles de segurança pela resposta, não pelo código.** Com a aplicação subida nos defaults versionados (sem `.env` local, ou com o `.env.example` copiado sem edição), chame cada rota sensível *sem* credencial e cada rota privilegiada com credencial de menor privilégio, e cole os status obtidos. `401`/`403` esperados que voltam `200` significam controle desligado, não controle implementado.
+   - **Monte a matriz de acesso e cubra 100% das rotas.** Uma linha por rota registrada — nenhuma omitida —, com o status obtido sem credencial, com credencial comum e com credencial privilegiada. O número de linhas tem que bater com o número de rotas do inventário do passo 5; rota que sobrou de fora da matriz é rota que ninguém testou. Toda linha marcada `público` precisa de uma justificativa na mesma tabela.
    - Se algo falhar, **corrija antes de declarar sucesso**. Nunca reporte validação verde sem ter executado o boot e as chamadas.
-7. Imprima o bloco `PHASE 3: REFACTORING COMPLETE` com a nova árvore de diretórios, o resultado real da validação e a lista de breaking changes de segurança (se houver).
-8. Salve o relatório de auditoria, agora acrescido da seção "Resultado da Refatoração".
+8. Imprima o bloco `PHASE 3: REFACTORING COMPLETE` com a nova árvore de diretórios, o resultado real da validação (matriz de acesso incluída) e a lista de breaking changes de segurança (se houver).
+9. Salve o relatório de auditoria, agora acrescido da seção "Resultado da Refatoração".
 
 ### Onde salvar o relatório
 

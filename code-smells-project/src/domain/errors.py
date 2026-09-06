@@ -35,3 +35,19 @@ class CredenciaisInvalidasError(DomainError):
 
 class RegraDeNegocioError(DomainError):
     status_code = 400
+
+
+class AutenticacaoError(DomainError):
+    """401 — a requisição chegou sem credencial válida."""
+    status_code = 401
+
+    def __init__(self, mensagem="Autenticação obrigatória"):
+        super().__init__(mensagem, incluir_sucesso=True)
+
+
+class PermissaoError(DomainError):
+    """403 — a credencial é válida, mas não tem o privilégio exigido pela rota."""
+    status_code = 403
+
+    def __init__(self, mensagem="Acesso negado"):
+        super().__init__(mensagem, incluir_sucesso=True)

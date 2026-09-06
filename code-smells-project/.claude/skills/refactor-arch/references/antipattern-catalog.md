@@ -117,9 +117,26 @@ Sinais: `AUTH_REQUIRED=false` no `.env.example`; `_bool('AUTH_REQUIRED', 'false'
 
 Trate como **CRITICAL, não como MEDIUM de configuração**: o que importa é o comportamento com os defaults versionados, e com eles a rota destrutiva responde sem credencial. A severidade é a mesma de não ter middleware nenhum — a diferença é só que aqui o código *parece* protegido, o que é pior, porque a revisão seguinte confia no decorator e não testa a chamada. Confirme sempre com a requisição real: suba a app nos defaults e chame `DELETE`/`POST` sem token; `200` responde a pergunta.
 
-**Por que CRITICAL:** MD5 sem salt cai por rainbow table em segundos e senhas iguais geram hashes iguais. Um token sem assinatura e sem expiração dá falsa impressão de autenticação onde não há nenhuma. Verifique também se existe alguma verificação de autorização: um método `is_admin()` definido e **nunca chamado** significa zero controle de acesso — e um middleware de auth que existe mas está atrás de flag desligada é a mesma ausência, com uma camada de disfarce a mais.
+**Controle de acesso simplesmente ausente** — o caso mais fácil de subnotificar, porque não há nada para o grep encontrar: o projeto não tem middleware de auth, não tem token, e por isso nenhuma linha suspeita aparece na varredura. A ausência é o achado. Conte, não procure:
 
-→ Correção: **RP-04**
+```bash
+# 1) quantas rotas o projeto registra
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "@[a-z_]*\.route\(|add_url_rule\(|router\.(get|post|put|delete|patch)\(|app\.(get|post|put|delete|patch)\(" . | wc -l
+# 2) quantas passam por algum guard de autenticação/autorização
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "require_auth|requireAuth|exigir_auten|login_required|jwt_required|authenticate|adminAuth|require_admin|exigir_admin|is_admin\(|before_request" . | wc -l
+# 3) existe emissão de credencial em algum lugar?
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "jwt\.(encode|sign)|issue_token|emitir_token|sign\(.*secret|session\[" .
+```
+
+Sinais: (2) devolve **0** enquanto (1) devolve dezenas; (3) não devolve nada e ainda assim existe uma rota `/login`; nenhum handler lê o header `Authorization`/`Cookie`; rota de relatório, faturamento, listagem de usuários ou escrita de catálogo responde `200` para `curl` sem nenhum header.
+
+Um `/login` que confere a senha e devolve o usuário **não** conta como autenticação: ele não emite credencial e nada do que devolve é exigido na chamada seguinte. Uma coluna `tipo`/`role`/`is_admin` que existe no schema e nunca aparece num `if` é a mesma coisa — papel declarado, nunca verificado.
+
+Trate como **CRITICAL** e descreva o alcance real no campo *Impacto*: **liste as rotas sensíveis que respondem sem credencial**, uma a uma (`GET /relatorios/vendas`, `GET /usuarios`, `DELETE /produtos/<id>`…). Essa lista é o que a Fase 3 vai ter que fechar rota por rota, e é por ela que o finding será conferido antes de ser marcado como resolvido.
+
+**Por que CRITICAL:** MD5 sem salt cai por rainbow table em segundos e senhas iguais geram hashes iguais. Um token sem assinatura e sem expiração dá falsa impressão de autenticação onde não há nenhuma. Verifique também se existe alguma verificação de autorização: um método `is_admin()` definido e **nunca chamado** significa zero controle de acesso — um middleware de auth que existe mas está atrás de flag desligada é a mesma ausência com uma camada de disfarce a mais, e a API sem nenhum guard é essa mesma ausência sem disfarce nenhum.
+
+→ Correção: **RP-04** (credencial guardada) + **RP-17** (rotas fechadas) — as duas, sempre. Hash forte não fecha rota nenhuma.
 
 ## AP-05 — Exposição de dado sensível
 
@@ -129,11 +146,13 @@ grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "'(password|se
 grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "(console\.log|print|logger)\(.*(card|cc|cvv|password|senha|secret|key)" .
 grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "@[a-z_]*\.route\(.*(admin|debug|query|reset)" .
 ```
-Sinais: `to_dict()` / serializer incluindo `password`; `SECRET_KEY` devolvida por `/health`; número de cartão em log; endpoint que executa **SQL arbitrário** vindo do corpo da requisição; endpoint destrutivo (`reset-db`, `DELETE /all`) sem autenticação; stack trace completo na resposta de erro.
+Sinais: `to_dict()` / serializer incluindo `password`; `SECRET_KEY` devolvida por `/health`; número de cartão em log; endpoint que executa **SQL arbitrário** vindo do corpo da requisição; endpoint destrutivo (`reset-db`, `DELETE /all`) sem autenticação; **endpoint de relatório, faturamento ou métrica de negócio (`/relatorios/*`, `/reports/*`, `/admin/*`, `financial-report`) acessível sem credencial**; stack trace completo na resposta de erro.
+
+O endpoint de relatório aberto costuma ser subnotificado por parecer "só leitura": ele agrega faturamento, ticket médio e volume de pedidos da operação inteira — é o dado que a concorrência compraria. Trate no mesmo nível do endpoint destrutivo aberto.
 
 **Por que CRITICAL:** um endpoint de SQL arbitrário aberto não é sequer injeção — é console de banco público. PAN de cartão em log quebra PCI-DSS: todo coletor de log (arquivo, Docker, CloudWatch) passa a guardar o dado em claro.
 
-→ Correção: **RP-02**, **RP-04**
+→ Correção: **RP-02**, **RP-04**, **RP-17** (para a rota que precisa deixar de ser anônima em vez de deixar de existir)
 
 ---
 
@@ -401,11 +420,13 @@ Sinais: `import os, sys, json` sem nenhum uso; função utilitária definida e n
 
 Percorra os 19 na ordem e marque cada um como presente/ausente. Um projeto "organizado" (com `models/`, `routes/`, `services/`) normalmente concentra os achados em **AP-06, AP-10, AP-11, AP-13, AP-19** — não conclua que está limpo sem checar essas cinco explicitamente.
 
+Antes de fechar a Fase 2, responda em uma linha: **quantas das rotas registradas exigem credencial?** Se a resposta for "nenhuma", AP-04 está presente por ausência de controle e o finding precisa listar as rotas sensíveis abertas — mesmo que o hash de senha do projeto esteja correto.
+
 ```
 [ ] AP-01 SQL Injection            [ ] AP-08 Estado global mutável     [ ] AP-15 API deprecated (obrigatório)
 [ ] AP-02 Segredos hardcoded       [ ] AP-09 Escrita sem transação     [ ] AP-16 Magic numbers
 [ ] AP-03 God Class                [ ] AP-10 Erro engolido/espalhado   [ ] AP-17 print como log
-[ ] AP-04 Auth quebrada            [ ] AP-11 Query N+1                 [ ] AP-18 Nomenclatura
+[ ] AP-04 Auth quebrada/ausente    [ ] AP-11 Query N+1                 [ ] AP-18 Nomenclatura
 [ ] AP-05 Dado sensível exposto    [ ] AP-12 Sem paginação             [ ] AP-19 Código/camada morta
 [ ] AP-06 Regra no controller      [ ] AP-13 Duplicação de regra
 [ ] AP-07 Sem injeção de dep.      [ ] AP-14 Validação ausente

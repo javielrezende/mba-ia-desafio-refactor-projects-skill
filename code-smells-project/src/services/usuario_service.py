@@ -11,11 +11,12 @@ EMAIL_EM_USO = "Email já cadastrado"
 
 class UsuarioService:
     def __init__(self, database, usuario_repository, hash_de_senha, verificar_senha,
-                 hash_dummy):
+                 hash_dummy, token_signer):
         self._db = database
         self._usuarios = usuario_repository
         self._hash_de_senha = hash_de_senha
         self._verificar_senha = verificar_senha
+        self._token_signer = token_signer
         # Hash descartável usado quando o e-mail não existe, para o tempo de
         # resposta não denunciar quais contas estão cadastradas.
         self._hash_dummy = hash_dummy
@@ -58,4 +59,9 @@ class UsuarioService:
 
         if linha is None or not senha_confere:
             raise CredenciaisInvalidasError()
-        return serializar_sessao(linha)
+
+        # O login legado devolvia só o dicionário do usuário — nada que a
+        # chamada seguinte precisasse apresentar. Agora ele emite a credencial
+        # que o gate de middlewares/auth.py exige.
+        usuario = serializar_sessao(linha)
+        return usuario, self._token_signer.emitir(usuario["id"], usuario["tipo"])

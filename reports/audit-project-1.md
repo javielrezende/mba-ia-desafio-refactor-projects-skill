@@ -7,8 +7,10 @@
 | **Domínio** | API de E-commerce (produtos, usuários/autenticação, pedidos com itens e baixa de estoque, relatório de vendas) |
 | **Arquitetura anterior** | Camadas nominais vazando — `app.py`/`controllers.py`/`models.py`/`database.py`, com regra de negócio no model e SQL no arquivo de rotas |
 | **Arquivos analisados** | 4 (780 linhas) |
-| **Data** | 2026-08-17 |
-| **Skill** | refactor-arch v1 |
+| **Endpoints** | 19 rotas |
+| **Auth** | 0 de 19 rotas exigem credencial — `POST /login` confere a senha e não emite token |
+| **Data** | 2026-08-17 (Fases 1-3) · 2026-09-01 (segunda passagem: gate de autenticação) |
+| **Skill** | refactor-arch v2 — reexecutada após o reforço da Fase 3 e do playbook (RP-17) |
 
 ## Resumo
 
@@ -102,11 +104,11 @@ Senha gravada em texto puro, inclusive no seed (`"admin123"`, `"123456"`). O log
 
 **Impacto**
 
-Vazamento do banco entregaria todas as senhas em claro. O campo `tipo: 'admin'` existia no schema e nunca era consultado: qualquer anônimo resetava o banco e lia o relatório de faturamento.
+Vazamento do banco entregaria todas as senhas em claro. O campo `tipo: 'admin'` existia no schema e nunca era consultado: **0 das 17 rotas exigiam credencial**. Qualquer anônimo resetava o banco, lia o relatório de faturamento (`GET /relatorios/vendas`), listava nome e e-mail de todos os clientes (`GET /usuarios`), lia o histórico de compras de qualquer pessoa (`GET /pedidos`, `GET /pedidos/usuario/<id>`) e criava, editava ou apagava produtos do catálogo (`POST`/`PUT`/`DELETE /produtos`).
 
 **Recomendação**
 
-Hash com `werkzeug.security` (scrypt), comparação em Python, política mínima de senha e caminho de login com custo constante. → RP-04
+Hash com `werkzeug.security` (scrypt), comparação em Python, política mínima de senha e caminho de login com custo constante (→ RP-04) **e** emissão de token no login com gate de acesso em todas as rotas de negócio (→ RP-17). O hash protege a senha guardada; ele não fecha rota nenhuma.
 
 ---
 
@@ -409,7 +411,7 @@ code-smells-project/
 └── database.py      86 linhas   conexão global + DDL + seed com senha em texto puro
 ```
 
-**Depois** — 27 módulos, 1.388 linhas (o maior arquivo tem 132):
+**Depois** — 41 arquivos `.py` / 31 módulos com conteúdo, 1.687 linhas (o maior arquivo tem 132):
 
 ```
 code-smells-project/
@@ -425,6 +427,7 @@ code-smells-project/
     │                               CredenciaisInvalidasError, RegraDeNegocioError
     ├── infrastructure/
     │   ├── database.py             Database: sessao()/transacao()/migrar(), FK + PRAGMA
+    │   ├── security.py             TokenSigner: JWT HS256 assinado, com expiração
     │   └── logger.py               logging estruturado
     ├── models/
     │   ├── produto_model.py        ProdutoRepository + serializador único
@@ -434,8 +437,9 @@ code-smells-project/
     │   ├── produto_service.py      usuario_service.py      pedido_service.py
     │   ├── relatorio_service.py    health_service.py       notification_service.py
     ├── controllers/                produto · usuario · pedido · relatorio · health
-    ├── views/routes.py             rota → controller, 17 rotas
+    ├── views/routes.py             rota → controller + gate de acesso, 17 rotas
     ├── middlewares/
+    │   ├── auth.py                 exigir_autenticacao / exigir_admin / exigir_dono_*
     │   ├── error_handler.py        handler central
     │   ├── validation.py           validar_corpo(schema)
     │   └── pagination.py           page/per_page com teto de 100
@@ -451,7 +455,7 @@ Os quatro arquivos legados foram removidos (`git rm controllers.py models.py dat
 | 1 | CRITICAL | SQL Injection | ✅ Resolvido | `src/models/*.py` — 100% parametrizado, inclusive a busca dinâmica e o `LIKE`. Varredura final: 0 matches |
 | 2 | CRITICAL | Exposição de dado sensível | ✅ Resolvido | `senha` fora da serialização (`usuario_model.py`), `/health` enxuto, `/admin/*` removidos, erro sem `str(e)` |
 | 3 | CRITICAL | Segredos hardcoded | ✅ Resolvido | `src/config/settings.py` + `.env.example`; `DEBUG=false` e `CORS_ORIGINS` restrito por default; `HOST` default `127.0.0.1` |
-| 4 | CRITICAL | Autenticação quebrada | ✅ Resolvido | Hash `scrypt` via `werkzeug.security`, coluna `senha_hash`, seed hasheado, comparação fora do SQL, login com custo constante contra hash dummy (sem enumeração de contas), endpoints administrativos sem autenticação removidos |
+| 4 | CRITICAL | Autenticação quebrada | ✅ Resolvido | **Credencial:** hash `scrypt` via `werkzeug.security`, coluna `senha_hash`, seed hasheado, comparação fora do SQL, login com custo constante contra hash dummy (sem enumeração de contas). **Gate (RP-17):** `POST /login` emite JWT HS256 com expiração (`infrastructure/security.py`) e `middlewares/auth.py` exige credencial nas 13 rotas de negócio — 4 públicas justificadas. Conferido pela chamada: ver *Matriz de acesso por rota* |
 | 5 | CRITICAL | God Module | ✅ Resolvido | 27 módulos, uma responsabilidade cada; maior arquivo 132 linhas |
 | 6 | HIGH | Regra no controller/model | ✅ Resolvido | `src/services/` — nenhum `request`/`jsonify` nas camadas internas (varredura limpa) |
 | 7 | HIGH | Sem injeção de dependência | ✅ Resolvido | `create_app()` constrói `Database`, repositórios e services e injeta; nenhum módulo abre a própria conexão |
@@ -467,13 +471,17 @@ Os quatro arquivos legados foram removidos (`git rm controllers.py models.py dat
 | 17 | LOW | Código morto | ✅ Resolvido | Arquivos legados removidos junto com os imports não usados |
 | 18 | LOW | Nomenclatura | ✅ Resolvido | `produto_id`/`usuario_id`/`pedido_id`; sufixo de camada (`...Repository`/`Service`/`Controller`). O parâmetro `id` permanece apenas na assinatura das rotas `/<int:id>`, para não alterar o contrato |
 
-**Nota de escopo sobre o finding 4.** Todos os sinais que o catálogo define como AP-04 estão fechados e verificados: nenhum MD5/SHA1, nenhuma senha em texto puro, nenhuma comparação direta `senha ==`, nenhum token previsível e nenhuma enumeração de contas por tempo de resposta. O sinal de autorização previsto no catálogo — "um método `is_admin()` definido e nunca chamado" — não se aplica: o código legado não define nenhuma função de autorização (verificado por varredura de `is_admin`, `require_`, `@login`, `role` nos quatro arquivos originais: zero ocorrências).
+**Segunda passagem — o que estava errado na primeira.** A primeira execução marcou o finding 4 como resolvido tendo tratado só a metade da credencial: hash `scrypt`, seed hasheado, login sem enumeração de contas e os dois endpoints `/admin/*` removidos. As outras **13 rotas continuavam respondendo a qualquer requisição anônima**, incluindo `GET /relatorios/vendas` — que é literalmente a frase escrita no campo *Impacto* do próprio finding. Um finding cujo impacto ainda se reproduz não está resolvido, por mais itens do catálogo que tenham sido fechados em volta dele.
 
-Adicionar um sistema de autenticação com token exigiria um cabeçalho `Authorization` em toda chamada de escrita — mudança de contrato bem além das duas exceções que a regra de preservação de comportamento autoriza (remover campo de senha da resposta e remover endpoint de SQL arbitrário). Por isso não foi implementado. Ver "Recomendações além do escopo desta refatoração", ao final.
+A justificativa registrada na época — *"exigir `Authorization` mudaria o contrato de toda chamada de escrita"* — é exatamente a que a regra 4 da skill recusa: correção de segurança muda o contrato e vai listada em *Breaking changes*, do mesmo jeito que a remoção do campo `senha` da resposta, que também quebra clientes e foi feita sem discussão.
+
+A skill foi corrigida antes de ser reexecutada — a ausência total de autenticação virou sinal explícito do AP-04, a Fase 3 ganhou o passo obrigatório de gate com inventário de rotas, o playbook ganhou **RP-17** e o template passou a exigir a matriz de acesso. Só então a Fase 3 rodou de novo neste projeto. O resultado está na tabela acima e na matriz abaixo.
 
 ### Validação
 
 Executada com a aplicação real em `http://127.0.0.1:5000`, comparando as **mesmas 32 chamadas** (19 endpoints, incluindo casos de erro) antes e depois, a partir de um banco recriado do zero nas duas execuções.
+
+As três primeiras linhas da tabela e os blocos de saída logo abaixo são da primeira passagem (2026-08-17), contra o código legado. As duas linhas de acesso e a seção *Matriz de acesso por rota* são da segunda passagem (2026-09-01), que comparou a versão sem gate com a versão com gate.
 
 | Verificação | Resultado |
 |---|---|
@@ -481,6 +489,8 @@ Executada com a aplicação real em `http://127.0.0.1:5000`, comparando as **mes
 | Endpoints originais respondem | ✅ 27/32 chamadas idênticas em status e corpo (ignorando timestamp volátil e o campo aditivo `meta`); as 5 divergências são as correções de segurança declaradas |
 | Casos de borda (suíte extra) | ✅ 36 casos comparados contra a versão legada restaurada do git, rodando lado a lado: 23 idênticos, 13 divergências, todas listadas e justificadas nas seções abaixo |
 | Varredura final do catálogo | ✅ 0 anti-patterns CRITICAL/HIGH remanescentes |
+| Matriz de acesso | ✅ 17/17 rotas conferidas pela chamada; 0 rota de negócio anônima (detalhe abaixo) |
+| Paridade com credencial | ✅ 25/25 chamadas idênticas em status e corpo entre a versão sem gate (anônima) e a versão com gate (credencial adequada) |
 | Transação com rollback | ✅ falha no meio do pedido não grava nada |
 | N+1 eliminado | ✅ 81 queries → 3 |
 | Integridade referencial | ✅ `FOREIGN KEY constraint failed` em item órfão |
@@ -586,6 +596,94 @@ HTTP framework em service/model .... 0 ocorrências
 SQL em controller/rota ............. 0 ocorrências
 ```
 
+### Matriz de acesso por rota
+
+Segunda passagem (2026-09-01). As duas versões subidas lado a lado com bancos
+recriados do zero — a de `HEAD` sem o gate na porta 5098, a refatorada na 5099 —
+e **as 17 rotas registradas** chamadas com três credenciais. Nenhuma omitida: o
+número de linhas bate com as 17 chamadas a `add_url_rule` de `src/views/routes.py`.
+
+| Rota | Classe | Anônimo (antes) | Anônimo (depois) | Cliente | Admin | Observação |
+|---|---|---|---|---|---|---|
+| `GET /` | público | 200 | 200 | 200 | 200 | liveness, sem dado de negócio |
+| `GET /health` | público | 200 | 200 | 200 | 200 | liveness, sem dado de negócio |
+| `GET /produtos` | autenticado | 200 | **401** | 200 | 200 | |
+| `GET /produtos/busca` | autenticado | 200 | **401** | 200 | 200 | |
+| `GET /produtos/<id>` | autenticado | 200 | **401** | 200 | 200 | |
+| `POST /produtos` | admin | 201 | **401** | **403** | 201 | escrita no catálogo |
+| `PUT /produtos/<id>` | admin | 200 | **401** | **403** | 200 | escrita no catálogo |
+| `DELETE /produtos/<id>` | admin | 200 | **401** | **403** | 200 | escrita no catálogo |
+| `GET /usuarios` | admin | 200 | **401** | **403** | 200 | cadastro de terceiros |
+| `GET /usuarios/<id>` | dono ou admin | 200 | **401** | 200 (próprio) / **403** (outro) | 200 | |
+| `POST /usuarios` | público | 201 | 201 | 201 | 201 | registro; conta criada sempre como `cliente` |
+| `POST /login` | público | 200 | 200 | 200 | 200 | emite o token |
+| `POST /pedidos` | dono ou admin | 201 | **401** | 201 (próprio) / **403** (outro) | 201 | `usuario_id` vem no corpo |
+| `GET /pedidos` | admin | 200 | **401** | **403** | 200 | histórico global |
+| `GET /pedidos/usuario/<id>` | dono ou admin | 200 | **401** | 200 (próprio) / **403** (outro) | 200 | |
+| `PUT /pedidos/<id>/status` | admin | 200 | **401** | **403** | 200 | altera o fluxo do pedido |
+| `GET /relatorios/vendas` | admin | 200 | **401** | **403** | 200 | **faturamento da operação — o finding 4** |
+
+Saída real da varredura pós-gate (`anon` / `cliente` / `admin`):
+
+```
+GET /                                  anon=200 cliente=200 admin=200
+GET /health                            anon=200 cliente=200 admin=200
+GET /produtos                          anon=401 cliente=200 admin=200
+GET /produtos/busca?q=Mouse            anon=401 cliente=200 admin=200
+GET /produtos/1                        anon=401 cliente=200 admin=200
+POST /produtos                         anon=401 cliente=403 admin=201
+PUT /produtos/1                        anon=401 cliente=403 admin=200
+DELETE /produtos/10                    anon=401 cliente=403 admin=200
+GET /usuarios                          anon=401 cliente=403 admin=200
+GET /usuarios/2                        anon=401 cliente=200 admin=200
+POST /usuarios                         anon=201 cliente=201 admin=201
+POST /login                            anon=200 cliente=200 admin=200
+POST /pedidos                          anon=401 cliente=201 admin=201
+GET /pedidos                           anon=401 cliente=403 admin=200
+GET /pedidos/usuario/2                 anon=401 cliente=200 admin=200
+PUT /pedidos/1/status                  anon=401 cliente=403 admin=200
+GET /relatorios/vendas                 anon=401 cliente=403 admin=200
+```
+
+Casos de borda do gate (cliente autenticado é `joao@email.com`, id 2):
+
+```
+GET  /usuarios/3          token de cliente (lendo outro usuário)   403
+GET  /pedidos/usuario/3   token de cliente (lendo outro usuário)   403
+POST /pedidos {"usuario_id":3}  token de cliente                   403
+GET  /relatorios/vendas   token adulterado no último caractere     401
+GET  /relatorios/vendas   header sem o prefixo "Bearer "           401
+GET  /relatorios/vendas   token vazio                              401
+
+{"erro":"Autenticação obrigatória","sucesso":false}          [401]
+{"erro":"Requer privilégio de administrador","sucesso":false} [403]
+```
+
+Assinatura e expiração conferidas com relógio injetado (`TokenSigner`): token válido
+decodifica; expirado, assinado com outra chave, com payload adulterado ou com lixo
+devolvem `None` — e portanto `401`.
+
+**Paridade de comportamento com a credencial correta.** As mesmas 25 chamadas
+(19 endpoints, incluindo casos de erro) rodadas contra as duas versões — a antiga
+sem credencial, a nova com a credencial que a rota exige — devolvem status e corpo
+idênticos:
+
+```
+OK  index 200->200          OK  criar_produto 201->201     OK  criar_usuario 201->201
+OK  health 200->200         OK  criar_produto_400 400->400 OK  criar_usuario_400 400->400
+OK  listar_produtos 200->200  OK  atualizar_produto 200->200 OK  login_ok 200->200
+OK  buscar_produtos 200->200  OK  atualizar_404 404->404    OK  login_401 401->401
+OK  buscar_produto 200->200   OK  deletar_404 404->404      OK  criar_pedido 201->201
+OK  buscar_produto_404 404->404 OK listar_usuarios 200->200 OK  criar_pedido_400 400->400
+OK  buscar_usuario 200->200   OK  buscar_usuario_404 404->404 OK listar_pedidos 200->200
+OK  pedidos_usuario 200->200  OK  status_pedido 200->200    OK  status_invalido 400->400
+OK  relatorio 200->200
+
+25/25 chamadas idênticas em status e corpo; 0 divergentes
+```
+
+Ou seja: o gate mudou **quem** pode chamar, não **o que** a API responde a quem pode.
+
 ### Breaking changes (correções de segurança)
 
 1. **`POST /admin/query` removido** — executava SQL arbitrário do corpo da requisição, sem autenticação.
@@ -593,6 +691,7 @@ SQL em controller/rota ............. 0 ocorrências
 3. **`GET /usuarios` e `GET /usuarios/<id>` não devolvem mais `senha`.**
 4. **`GET /health` não devolve mais `secret_key`, `debug`, `db_path` nem `ambiente`** — permanecem `status`, `database`, `counts` e `versao`.
 5. **Respostas 500 não trazem mais a mensagem da exceção** — passam a devolver `{"erro": "Erro interno"}`, com o stack trace no log.
+6. **As 13 rotas de negócio passam a exigir `Authorization: Bearer <token>`** (segunda passagem, RP-17). Sem token a resposta é `401`; com token de privilégio insuficiente, `403`. Continuam públicas apenas `GET /`, `GET /health`, `POST /login` (emite o token) e `POST /usuarios` (registro — a conta é sempre criada como `cliente`, então não é caminho de escalada de privilégio). Clientes que chamavam a API anonimamente precisam passar a autenticar. `POST /login` ganha o campo aditivo `token` no corpo; as chaves antigas seguem iguais.
 
 > A `SECRET_KEY` exposta continua no histórico do Git. Remover do código não basta: **o valor precisa ser rotacionado**, e o mesmo vale para as senhas do seed (`admin123`, `123456`, `senha123`), que estavam versionadas em texto puro.
 
@@ -619,12 +718,17 @@ Registradas por transparência — nenhuma altera rota, método ou forma de resp
 pip install -r requirements.txt
 cp .env.example .env      # preencha SECRET_KEY — sem ela o boot falha
 python app.py
+
+# toda rota de negócio exige credencial:
+TOKEN=$(curl -s -X POST localhost:5000/login -H 'Content-Type: application/json' \
+  -d '{"email":"admin@loja.com","senha":"admin123"}' | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+curl -H "Authorization: Bearer $TOKEN" localhost:5000/relatorios/vendas
 ```
 
 ## Recomendações além do escopo desta refatoração
 
 Itens que **não** são pendências desta entrega — nenhum deles corresponde a um sinal aberto do catálogo — mas que merecem entrar no próximo ciclo:
 
-1. **Autenticação e autorização.** A API não exige credencial em nenhuma rota: `GET /usuarios` expõe nome e e-mail, `GET /relatorios/vendas` expõe faturamento, e qualquer anônimo cria, edita ou apaga produtos. Isso já era assim na versão legada — não é regressão da refatoração. A base para resolver já existe: senhas com hash, `POST /login` validando credencial de verdade e a coluna `tipo` (`cliente`/`admin`) no schema. Falta emitir um token assinado no login e exigi-lo por middleware nas rotas sensíveis. Como isso muda o contrato de toda chamada de escrita, deve ser tratado como versão nova da API, não como refatoração.
+1. **Refresh token e revogação.** O gate de autenticação foi entregue (RP-17): token JWT HS256 com expiração de 1 h, `401` sem credencial e `403` sem privilégio, conferidos rota a rota na matriz acima. O que fica para o próximo ciclo é o ciclo de vida da credencial — *refresh token*, revogação por logout e lista de tokens invalidados —, que exige uma tabela de sessões e não é pré-requisito do controle de acesso.
 2. **Rotacionar os segredos expostos.** A `SECRET_KEY` e as senhas do seed (`admin123`, `123456`, `senha123`) continuam no histórico do Git. Removê-las do código não basta — os valores precisam ser trocados.
 3. **Testes automatizados.** A validação desta refatoração foi feita comparando as duas versões rodando lado a lado. Com as camadas separadas e as dependências injetadas, os services agora são testáveis sem servidor nem banco real — vale converter essa suíte de comparação em testes versionados.
