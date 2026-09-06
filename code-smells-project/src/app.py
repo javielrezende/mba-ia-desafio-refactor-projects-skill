@@ -11,6 +11,7 @@ from src.controllers.relatorio_controller import RelatorioController
 from src.controllers.usuario_controller import UsuarioController
 from src.infrastructure.database import Database
 from src.infrastructure.logger import configurar_logger
+from src.infrastructure.security import TokenSigner
 from src.middlewares.error_handler import registrar_error_handlers
 from src.models.pedido_model import PedidoRepository
 from src.models.produto_model import ProdutoRepository
@@ -40,6 +41,8 @@ def create_app(settings=None, database=None, logger=None, migrar=True):
     usuario_repository = UsuarioRepository()
     pedido_repository = PedidoRepository()
 
+    token_signer = TokenSigner(settings.SECRET_KEY, settings.TOKEN_TTL_SECONDS)
+
     notificador = NotificationService(logger)
     produto_service = ProdutoService(database, produto_repository)
     usuario_service = UsuarioService(
@@ -49,6 +52,7 @@ def create_app(settings=None, database=None, logger=None, migrar=True):
         _verificar_senha,
         # Custo fixo para o caminho "e-mail inexistente" do login.
         generate_password_hash("hash-descartavel-para-tempo-constante"),
+        token_signer,
     )
     pedido_service = PedidoService(
         database, pedido_repository, produto_repository, usuario_repository, notificador
@@ -75,4 +79,7 @@ def create_app(settings=None, database=None, logger=None, migrar=True):
 
     app.extensions["settings"] = settings
     app.extensions["logger"] = logger
+    # O gate de autenticação lê o assinante daqui: nenhum middleware constrói a
+    # própria dependência nem importa settings direto.
+    app.extensions["token_signer"] = token_signer
     return app

@@ -11,6 +11,8 @@ class HealthController:
         return jsonify(self._service.status()), 200
 
     def index(self):
+        # Rota pública de liveness: lista os caminhos, nunca o dado por trás
+        # deles. Cada um exige credencial, exceto /login, POST /usuarios e este.
         return jsonify({
             "mensagem": "Bem-vindo à API da Loja",
             "versao": self._versao,

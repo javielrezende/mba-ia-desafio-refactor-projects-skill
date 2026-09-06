@@ -25,9 +25,11 @@ class UsuarioController:
         return jsonify({"dados": {"id": usuario_id}, "sucesso": True}), 201
 
     def login(self, dados):
-        usuario = self._service.autenticar(dados["email"], dados["senha"])
+        usuario, token = self._service.autenticar(dados["email"], dados["senha"])
+        # `token` é aditivo ao corpo legado: as chaves antigas seguem iguais.
         return jsonify({
             "dados": usuario,
+            "token": token,
             "sucesso": True,
             "mensagem": "Login OK",
         }), 200

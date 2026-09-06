@@ -33,6 +33,10 @@ class Settings:
             for origem in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
             if origem.strip()
         ]
+        # Não existe flag de autenticação, de propósito. O ambiente escolhe
+        # *qual* chave assina o token e por *quanto tempo* ele vale — nunca *se*
+        # a verificação acontece. Ver o cabeçalho de middlewares/auth.py.
+        self.TOKEN_TTL_SECONDS = int(os.getenv("TOKEN_TTL_SECONDS", "3600"))
         self.LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
         self.API_VERSION = os.getenv("API_VERSION", "1.0.0")
 

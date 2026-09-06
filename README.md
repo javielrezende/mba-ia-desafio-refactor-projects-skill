@@ -778,7 +778,7 @@ A skill vive em `.claude/skills/refactor-arch/` e é composta por um `SKILL.md` 
     ├── antipattern-catalog.md            # Fase 2 — 19 anti-patterns com sinais de detecção
     ├── report-template.md                # Fase 2 — formato do relatório
     ├── architecture-guidelines.md        # Fase 3 — MVC alvo e estrutura por stack
-    └── refactoring-playbook.md           # Fase 3 — 16 transformações antes/depois
+    └── refactoring-playbook.md           # Fase 3 — 17 transformações antes/depois
 ```
 
 ### Decisões de design
@@ -815,7 +815,7 @@ O mínimo exigido era 8; o catálogo tem **19**, com severidade distribuída. A 
 | AP-01 | CRITICAL | SQL Injection por concatenação | Projeto 1, achado 1 (~15 ocorrências em `models.py`) |
 | AP-02 | CRITICAL | Credenciais e segredos hardcoded | Projetos 1, 2 e 3 — `SECRET_KEY`, `pk_live_*`, SMTP |
 | AP-03 | CRITICAL | God Class / God Module | Projeto 2, achado 1 (`AppManager.js`) |
-| AP-04 | CRITICAL | Autenticação quebrada / hashing fraco | Projeto 3, achado 1 (MD5 sem salt); `badCrypto` do projeto 2 |
+| AP-04 | CRITICAL | Autenticação quebrada, ausente ou desligada | Projeto 3, achado 1 (MD5 sem salt); `badCrypto` do projeto 2; **ausência total de guard** nos três (0 rotas exigiam credencial) |
 | AP-05 | CRITICAL | Exposição de dado sensível | Senha no JSON (proj. 3), cartão em log (proj. 2), `/admin/query` (proj. 1) |
 | AP-06 | HIGH | Regra de negócio dentro do handler | Projeto 3, achado 3 — a violação central de MVC |
 | AP-07 | HIGH | Acoplamento forte, sem injeção de dependência | Projeto 2 — `new sqlite3.Database` no construtor |
@@ -837,6 +837,8 @@ Três escolhas dentro do catálogo merecem justificativa:
 - **AP-15 é a única checagem marcada como obrigatória.** O desafio exige detecção de APIs deprecated, e é o tipo de coisa que um auditor pula quando não encontra nada. A regra é que a linha `Deprecated APIs:` apareça no relatório **sempre**, inclusive como `nenhuma ocorrência encontrada` — assim o item do checklist é auditável nos dois casos. A tabela cobre 17 APIs de Python, Flask, SQLAlchemy 2.0, Node, Express 5, Sequelize e JavaScript.
 - **Regras de promoção de severidade, em vez de severidade fixa por ID.** Um `console.log` é AP-17 (LOW); um `console.log` imprimindo número de cartão é AP-05 (CRITICAL). O catálogo tem uma regra explícita: exposição de dado sensível sobe para CRITICAL, e um achado sobe de nível se tornar o código impossível de testar em isolamento. Sem isso, o `AppManager.js:45` do projeto 2 seria classificado como um problema de legibilidade.
 - **Agrupamento por raiz.** Quinze `print()` viram **um** finding com sub-itens. A regra existe porque a alternativa — inflar a contagem com ocorrências repetidas — atinge o mínimo de 5 findings sem auditar nada.
+
+- **AP-04 cobre três estados diferentes, e o terceiro só entrou na segunda devolutiva.** Hash fraco é o caso óbvio; guard atrás de flag desligada foi a primeira devolutiva; **ausência total de controle de acesso** foi a segunda. Este último é o mais fácil de subnotificar, porque não existe padrão suspeito para o grep encontrar — a detecção é por **contagem**: rotas registradas contra rotas com guard. Por isso a correção virou uma transformação própria, **RP-17**, separada do RP-04: hash forte protege a senha guardada e não fecha rota nenhuma.
 
 O `AP-19` (código morto) e o `AP-06` (regra no handler) são os que justificam a existência do terceiro projeto: são os únicos que aparecem em codebases já organizadas por pasta.
 
@@ -907,6 +909,63 @@ A correção foi na skill, não no projeto — e só então o projeto foi reproc
 
 As três execuções da skill estão registradas em `reports/audit-project-{1,2,3}.md`. Os números abaixo saem desses relatórios e da validação executada no repositório — nenhum é estimativa.
 
+### Saída da Fase 1 nos três projetos
+
+O bloco descritivo que a skill imprime antes de qualquer julgamento. Os números
+saem de comando executado (`find`, `wc -l`, contagem de rotas), não de estimativa.
+
+```
+================================
+PHASE 1: PROJECT ANALYSIS
+================================
+Language:      Python 3.12
+Framework:     Flask 3.1.1
+Dependencies:  flask-cors
+Domain:        API de E-commerce (produtos, usuários, pedidos com itens, relatório de vendas)
+Architecture:  Camadas nominais vazando — app.py/controllers.py/models.py/database.py,
+               com regra de negócio no model e SQL no arquivo de rotas
+Source files:  4 files analyzed | ~780 lines
+DB tables:     produtos, usuarios, pedidos, itens_pedido
+Auth:          0 de 19 rotas exigem credencial (login não emite token)
+Entry point:   app.py (`python app.py`, debug=True, host 0.0.0.0)
+================================
+
+================================
+PHASE 1: PROJECT ANALYSIS
+================================
+Language:      JavaScript (Node.js 24)
+Framework:     Express 4 (^4.18.2, lock 4.22.1)
+Dependencies:  sqlite3 ^5.1.6
+Domain:        LMS com fluxo de checkout (usuários, cursos, matrículas, pagamentos, audit log)
+Architecture:  God Class — AppManager (141 linhas) com conexão, DDL, seed, roteamento e regra
+Source files:  3 files analyzed | ~180 lines
+DB tables:     users, courses, enrollments, payments, audit_logs
+Auth:          0 de 3 rotas exigem credencial (nenhum middleware de autenticação)
+Entry point:   src/app.js (`npm start` → main: src/app.js)
+================================
+
+================================
+PHASE 1: PROJECT ANALYSIS
+================================
+Language:      Python 3.12.3
+Framework:     Flask 3.0.0 + Flask-SQLAlchemy 3.1.1 (SQLAlchemy 2.0.52)
+Dependencies:  python-dotenv (declarado e nunca importado)
+Domain:        Task Manager (tasks, usuários, categorias, relatórios de produtividade)
+Architecture:  Camadas por pasta, sem controller/service — models/, routes/, services/, utils/
+               existem, mas 100% da regra vive nos handlers HTTP
+Source files:  14 files analyzed | ~1.158 lines (1 seed, 3 __init__)
+DB tables:     users, tasks, categories
+Auth:          0 de 22 rotas exigem credencial (login devolve 'fake-jwt-token-' + id, que
+               nenhuma rota valida)
+Entry point:   app.py (`python app.py`, debug=True, host 0.0.0.0)
+================================
+```
+
+A linha `Auth` é medida na Fase 1 — contagem de rotas registradas contra contagem
+de rotas com guard — e é o número que vira finding AP-04 na Fase 2 e RP-17 na
+Fase 3. Nos três projetos ela começou em zero; hoje é 13/17, 2/3 e 18/22, com as
+públicas declaradas e justificadas rota a rota nos relatórios.
+
 ### Resumo dos relatórios de auditoria
 
 | # | Projeto | Stack detectada na Fase 1 | Arquivos | CRITICAL | HIGH | MEDIUM | LOW | Total |
@@ -934,16 +993,16 @@ Os três passam com folga o mínimo de 5 findings e o mínimo de 1 CRITICAL/HIGH
 **Projeto 1 — `code-smells-project`**
 
 ```
-ANTES  (4 arquivos, 780 linhas)          DEPOIS (39 arquivos, 1.419 linhas)
+ANTES  (4 arquivos, 780 linhas)          DEPOIS (41 arquivos, 1.687 linhas)
 app.py            88   rotas             app.py                  entry point
 controllers.py   292   handlers          src/config/             settings + constantes
 models.py        314   SQL + regra       src/models/             acesso a dados
 database.py       86   conexão + seed    src/services/           regra de negócio
                                          src/controllers/        fluxo HTTP
-                                         src/views/routes.py     roteamento
+                                         src/views/routes.py     roteamento + gate de acesso
                                          src/schemas/            validação
-                                         src/middlewares/        erro, paginação
-                                         src/infrastructure/     db, logger
+                                         src/middlewares/        auth, erro, paginação
+                                         src/infrastructure/     db, logger, token
                                          src/domain/errors.py    exceções de domínio
 ```
 
@@ -1024,9 +1083,11 @@ O código cresce em linhas porque validação, tratamento de erro e configuraç�
 | Views/Routes separadas para roteamento | ✅ `views/routes.py` | ✅ `routes/index.js` | ✅ `views/routes.py` |
 | Controllers concentram o fluxo da aplicação | ✅ 5 | ✅ 3 | ✅ 5 |
 | Error handling centralizado | ✅ `middlewares/error_handler.py` | ✅ `middlewares/errorHandler.js` | ✅ `middlewares/error_handler.py` |
+| Gate de autenticação aplicado nas rotas (RP-17) | ✅ `middlewares/auth.py` — 13/17 rotas | ✅ `middlewares/adminAuth.js` — 2/3 rotas | ✅ `middlewares/auth.py` — 18/22 rotas |
+| Nenhuma rota sensível responde sem credencial | ✅ matriz 17/17 | ✅ matriz 3/3 | ✅ matriz 22/22 |
 | Entry point claro | ✅ `app.py` | ✅ `src/server.js` | ✅ `app.py` |
 | Aplicação inicia sem erros | ✅ | ✅ | ✅ |
-| Endpoints originais respondem corretamente | ✅ 11/11 | ✅ 5/5 | ✅ 14/14 |
+| Endpoints originais respondem corretamente | ✅ 25/25 (com credencial) | ✅ 5/5 | ✅ 26/26 (com credencial) |
 
 **Critérios de aceite do desafio — 3/3 projetos**
 
@@ -1044,27 +1105,29 @@ Saída real de boot + smoke test dos três projetos, executados em sequência a 
 **Projeto 1 — `code-smells-project`** (`.venv/bin/python app.py`)
 
 ```
-2026-08-22 21:15:09,103 INFO loja servidor iniciado em http://127.0.0.1:5000
+2026-09-01 22:39:13,670 INFO loja servidor iniciado em http://127.0.0.1:5000
  * Serving Flask app 'src.app'
  * Debug mode: off
-2026-08-22 21:15:09,106 INFO werkzeug WARNING: This is a development server. Do not use it in a production deployment.
+2026-09-01 22:39:13,674 INFO werkzeug WARNING: This is a development server. Do not use it in a production deployment.
  * Running on http://127.0.0.1:5000
  * Press CTRL+C to quit
 
-GET    /                            200
-GET    /health                      200
-GET    /produtos                    200
-GET    /produtos/busca?q=note       200
-GET    /produtos/1                  200
-GET    /usuarios                    200
-GET    /usuarios/1                  200
-GET    /pedidos                     200
-GET    /pedidos/usuario/1           200
-GET    /relatorios/vendas           200
-POST   /login (senha errada)        401
+GET    /                                  200
+GET    /health                            200
+GET    /produtos            (sem token)   401
+GET    /produtos            (com token)   200
+GET    /produtos/busca?q=note (com token) 200
+GET    /produtos/1          (com token)   200
+GET    /usuarios            (sem token)   401
+GET    /usuarios            (token admin) 200
+GET    /pedidos             (token admin) 200
+GET    /pedidos/usuario/1   (token admin) 200
+GET    /relatorios/vendas   (sem token)   401
+GET    /relatorios/vendas   (token admin) 200
+POST   /login (senha errada)              401
 ```
 
-`debug=off` e o log estruturado com nome de aplicação (`loja`) são o resultado direto da correção dos findings 3 (segredos/config) e 16 (`print` como log). O `401` no login é o comportamento correto — antes da refatoração, `' OR '1'='1` como senha devolvia o usuário admin.
+`debug=off` e o log estruturado com nome de aplicação (`loja`) são o resultado direto da correção dos findings 3 (segredos/config) e 16 (`print` como log). O `401` no login é o comportamento correto — antes da refatoração, `' OR '1'='1` como senha devolvia o usuário admin. Os demais `401` são o gate de autenticação da segunda devolutiva: `GET /relatorios/vendas` sem token respondia `200` até esta rodada.
 
 **Projeto 2 — `ecommerce-api-legacy`** (`npm start`)
 
@@ -1117,6 +1180,7 @@ A refatoração preservou o contrato de API — mesmas rotas, mesmos métodos, m
 | 1 | `POST /admin/query` e `POST /admin/reset-db` **removidos** — executavam SQL arbitrário e apagavam as 4 tabelas, sem autenticação | 2 |
 | 1 | `GET /usuarios` e `/usuarios/<id>` não devolvem mais `senha`; `/health` não devolve mais `secret_key`, `debug`, `db_path` nem `ambiente` | 2 |
 | 1 | Respostas 500 devolvem `{"erro": "Erro interno"}` em vez da mensagem da exceção | 10 |
+| 1 | **Autenticação obrigatória em 13 das 17 rotas** — só `POST /login`, `POST /usuarios`, `GET /` e `GET /health` respondem sem token. Sem token, `401`; com papel insuficiente, `403`. `POST /login` passa a devolver o campo aditivo `token` | 4 |
 | 2 | `GET /api/admin/financial-report` e `DELETE /api/users/:id` passam a exigir `X-Admin-Api-Key` | 5 |
 | 2 | `POST /api/checkout` valida senha (mín. 8), e-mail e cartão — payloads antes aceitos respondem 400 | 4, 12 |
 | 3 | **Autenticação obrigatória em 18 das 22 rotas** — só `POST /login`, `POST /users`, `GET /` e `GET /health` respondem sem token. Sem token, `401`; com papel insuficiente, `403` | 2 |
@@ -1129,13 +1193,19 @@ A refatoração preservou o contrato de API — mesmas rotas, mesmos métodos, m
 
 ## Revisão pós-devolutiva
 
+Duas rodadas de devolutiva, dois defeitos da **mesma família** — a Fase 3 fechando
+um finding de autenticação pela metade e o relatório dando o item por resolvido.
+Nas duas vezes o conserto começou pela skill, e só depois pelo projeto.
+
+### Primeira devolutiva — o guard atrás da flag (`task-manager-api`)
+
 A primeira entrega recebeu do instrutor uma devolutiva precisa:
 
 > A infraestrutura de autenticação que a Fase 3 construiu no `task-manager-api` está bem feita, mas fica desligada por padrão: `AUTH_REQUIRED=false` no `.env.example` e no `settings.py`, e todo guard do `auth.py` só barra quando essa flag está ligada, então o `DELETE /users/` segue aberto sem token, que é justamente o impacto do CRITICAL 2 do seu relatório. Ajuste a regra de preservação de comportamento e o playbook para tratar exigir autenticação como breaking change de segurança, igual você já fez com a remoção do campo de senha, e rode a skill de novo nesse projeto.
 
 O diagnóstico estava certo, inclusive na ordem das causas: **o defeito era da skill**, e o projeto era só onde ele aparecia. Por isso a revisão começou pela skill.
 
-### O que mudou na skill
+#### O que mudou na skill
 
 A skill é idêntica nas três cópias (`code-smells-project/`, `ecommerce-api-legacy/`, `task-manager-api/`); todas foram atualizadas.
 
@@ -1149,11 +1219,11 @@ A skill é idêntica nas três cópias (`code-smells-project/`, `ecommerce-api-l
 | `references/architecture-guidelines.md` | *Defaults seguros* passou a incluir **autenticação exigida**, mais a regra geral: configuração escolhe *qual* segredo e *qual* TTL, nunca *se* a verificação acontece |
 | `references/report-template.md` | O exemplo de *Breaking changes* ganhou a exigência de token; a lista de *erros que invalidam o relatório* ganhou o item de marcar como resolvido um finding cujo controle está desligado nos defaults |
 
-### O que a skill reprocessada encontrou
+#### O que a skill reprocessada encontrou
 
 Rodada de novo no `task-manager-api`, a Fase 2 acusou o problema pelos greps novos — sete pontos: o default no `.env.example`, o default no `settings.py` e os cinco guards condicionados em `auth.py`. A confirmação veio da requisição real, com a aplicação nos defaults versionados: **as 22 rotas respondiam sem nenhuma credencial**, `DELETE /users/3` incluído.
 
-### O que mudou no projeto
+#### O que mudou no projeto
 
 | Arquivo | Mudança |
 |---|---|
@@ -1167,7 +1237,7 @@ Rodada de novo no `task-manager-api`, a Fase 2 acusou o problema pelos greps nov
 
 **Escopo escolhido: tudo autenticado, menos login, registro e liveness.** Exigir token só nas escritas fecharia o `DELETE /users/<id>` da devolutiva, mas deixaria `GET /users` entregando a lista de e-mails de todos os usuários e `GET /reports/summary` entregando a produtividade de cada um para qualquer anônimo — os dois estão citados no *Impacto* do finding 2. Parar nas escritas seria fechar o finding pela metade outra vez.
 
-### Antes e depois, medido
+#### Antes e depois, medido
 
 Mesmo probe, mesma aplicação, sem nenhuma credencial:
 
@@ -1196,6 +1266,101 @@ Mesmo probe, mesma aplicação, sem nenhuma credencial:
 | Varredura dos greps novos do AP-04 | ✅ 0 ocorrências em código executável |
 
 A comparação lado a lado é o ponto que fecha a devolutiva: **dado um token válido, as duas versões respondem exatamente a mesma coisa em 26/26 casos** — leituras, escritas, `404`, `400` de validação, `401` de credencial inválida e paginação. A única diferença de comportamento é a exigência do header. É o que caracteriza a mudança como breaking change de segurança bem delimitado, e não como refatoração que alterou o contrato por descuido.
+
+---
+
+### Segunda devolutiva — o gate que nunca chegou a existir (`code-smells-project`)
+
+A rodada seguinte recebeu esta devolutiva:
+
+> No `code-smells-project` o finding 4 do `audit-project-1.md` está marcado como resolvido, mas nenhuma rota do projeto exige credencial e o `GET /relatorios/vendas` continua aberto, que é justamente o impacto descrito no próprio finding. Reforce a Fase 3 e o playbook da sua skill para aplicar nesse projeto o mesmo gate de autenticação que ela já aplica no `ecommerce-api-legacy` e no `task-manager-api`, e rode a skill de novo.
+
+Confirmado por medição antes de mexer em qualquer coisa: **17 rotas registradas, 0
+com guard**, e `GET /relatorios/vendas` devolvendo `200` com o faturamento da
+operação para `curl` sem header nenhum.
+
+**Por que a rodada anterior não pegou isso.** A correção da primeira devolutiva
+mirou no *sintoma que apareceu lá*: o guard construído e desligado por flag. Toda
+a linguagem nova — os greps do AP-04, a seção de RP-04, o item da lista de erros
+do relatório — falava de *controle presente e desligado*. No `code-smells-project`
+o controle nunca chegou a ser construído: não havia flag, não havia decorator, não
+havia `is_admin()` não chamado. **Não havia nada — e "nada" não casa com nenhum
+grep.** A skill tratou o hash `scrypt` e a remoção dos dois `/admin/*` como o
+finding inteiro, e o relatório registrou a justificativa que a regra 4 já recusava
+por escrito: *"exigir `Authorization` mudaria o contrato de toda chamada de
+escrita"*.
+
+O erro de fundo é o mesmo das duas vezes: **conferir o finding pelos sinais que
+sobraram no código, em vez de conferir pelo impacto que ele mesmo descreve.** O
+campo *Impacto* do finding 4 dizia, desde a primeira versão do relatório, que
+qualquer anônimo lia o relatório de faturamento. Bastava tentar.
+
+#### O que mudou na skill (segunda rodada)
+
+| Arquivo | Mudança |
+|---|---|
+| `SKILL.md` — regra 4 | A exceção de segurança passou a incluir, com todas as letras, o caso *"o projeto legado não tem mecanismo de autenticação nenhum"*: o gate é **construído do zero**, não dispensado por não existir |
+| `SKILL.md` — Fase 3, passo 5 (novo) | Passo obrigatório e não condicional: instalar o gate (RP-17) com **inventário de todas as rotas**, cada uma classificada em `público`/`autenticado`/`privilegiado`. Traz a tabela dos três estados possíveis do projeto legado (tem guard parcial / tem login decorativo / não tem nada) e a regra de que remover endpoint administrativo perigoso **não** substitui o gate |
+| `SKILL.md` — Fase 3, passo 6 | Novo critério de "Resolvido": **cada frase escrita no campo *Impacto* do finding precisa ter deixado de ser verdade**. Terceira justificativa recusada nominalmente: *"o projeto não tinha autenticação, então não havia o que consertar"* |
+| `SKILL.md` — Fase 3, passo 7 | A validação passou a exigir a **matriz de acesso cobrindo 100% das rotas** — o número de linhas tem que bater com o número de rotas registradas |
+| `references/refactoring-playbook.md` — **RP-17** (novo) | Transformação nova, *Gate de autenticação por rota*: caso A (projeto sem nenhum mecanismo — antes/depois do `/login` que só devolve o usuário até o `TokenSigner` + decorators), caso B (guard parcial ou atrás de flag), o inventário de rotas como entrega, as quatro regras sem exceção e o bloco de prova por chamada |
+| `references/antipattern-catalog.md` — AP-04 | Subseção *"Controle de acesso simplesmente ausente"*: em vez de procurar padrão suspeito, **contar** rotas registradas contra rotas com guard. `0 de 17` é o achado. Registra que um `/login` que não emite credencial vale **zero**, e manda listar no *Impacto* as rotas sensíveis abertas, uma a uma |
+| `references/antipattern-catalog.md` — AP-05 | Endpoint de relatório/faturamento aberto virou sinal explícito, no mesmo nível do endpoint destrutivo aberto — era exatamente o que passou batido |
+| `references/project-analysis.md` | A Fase 1 passou a medir e imprimir a linha `Auth: <N> de <M> rotas exigem credencial`. O `0 de 17` aparece como fato descritivo já na primeira fase, antes de qualquer julgamento |
+| `references/architecture-guidelines.md` | Camada *Middlewares* ganhou o gate (deny-by-default, lista de públicas no arquivo de rotas); o checklist da Fase 3 ganhou 4 itens de acesso; a seção de validação ganhou o script pronto da matriz |
+| `references/report-template.md` | Seção *Matriz de acesso por rota* como parte obrigatória do resultado; dois erros novos que invalidam o relatório — marcar finding de auth como resolvido com alguma rota não pública aberta, e matriz que cobre menos rotas do que a aplicação registra |
+
+#### O que mudou no projeto
+
+| Arquivo | Mudança |
+|---|---|
+| `src/infrastructure/security.py` *(novo)* | `TokenSigner`: JWT HS256 assinado com a `SECRET_KEY` e com expiração, montado com a stdlib (`hmac`+`hashlib`+`base64`) — nenhuma dependência nova. Recebe segredo e TTL por injeção |
+| `src/middlewares/auth.py` *(novo)* | `exigir_autenticacao`, `exigir_admin`, `exigir_dono_ou_admin(param)` e `exigir_dono_no_corpo(campo)`. Sem flag: o guard vale sempre |
+| `src/views/routes.py` | As 17 rotas passaram a declarar seu gate na própria linha do mapeamento; as 4 públicas ficaram em `ROTAS_PUBLICAS`, com o motivo de cada uma |
+| `src/services/usuario_service.py` · `controllers/usuario_controller.py` | `POST /login` passou a emitir o token, devolvido no campo aditivo `token` — as chaves antigas do corpo seguem iguais |
+| `src/domain/errors.py` | `AutenticacaoError` (401) e `PermissaoError` (403) |
+| `src/config/settings.py` · `.env.example` | `TOKEN_TTL_SECONDS` (parâmetro). Nenhuma variável liga ou desliga a verificação |
+| `src/app.py` | Constrói o `TokenSigner` e o injeta; o middleware lê de `app.extensions`, não importa `settings` |
+| `code-smells-project/README.md` | Seção *Autenticação* com exemplo de `curl` e tabela de acesso por rota |
+| `reports/audit-project-1.md` | Finding 4 refeito: o *Impacto* passou a listar as rotas abertas uma a uma; a "nota de escopo" que justificava não implementar autenticação foi substituída pelo registro do que estava errado; seção *Matriz de acesso por rota* nova; *Breaking changes* ganhou o item 6 |
+
+**Escopo escolhido: tudo autenticado, menos login, registro e liveness.** Fechar só
+`GET /relatorios/vendas` atenderia a devolutiva ao pé da letra e deixaria
+`GET /usuarios` entregando nome e e-mail de todos os clientes e `GET /pedidos`
+entregando o histórico de compras de qualquer pessoa — as duas coisas estão
+escritas no *Impacto* do finding 4. É o mesmo critério aplicado no
+`task-manager-api` na rodada anterior.
+
+#### Antes e depois, medido
+
+As duas versões subidas lado a lado (a de `HEAD` sem gate na porta 5098, a
+refatorada na 5099), bancos recriados do zero, as **17 rotas** chamadas com três
+credenciais:
+
+| | Antes (anônimo) | Depois (anônimo) | Cliente | Admin |
+|---|:--:|:--:|:--:|:--:|
+| **`GET /relatorios/vendas`** | **200** | **401** | **403** | 200 |
+| `GET /usuarios` | 200 | **401** | **403** | 200 |
+| `GET /pedidos` | 200 | **401** | **403** | 200 |
+| `PUT /pedidos/<id>/status` | 200 | **401** | **403** | 200 |
+| `POST` / `PUT` / `DELETE /produtos` | 201 / 200 / 200 | **401** | **403** | 201 / 200 / 200 |
+| `GET /produtos`, `/produtos/busca`, `/produtos/<id>` | 200 | **401** | 200 | 200 |
+| `GET /usuarios/<id>`, `GET /pedidos/usuario/<id>` | 200 | **401** | 200 (próprio) / **403** (outro) | 200 |
+| `POST /pedidos` | 201 | **401** | 201 (próprio) / **403** (outro) | 201 |
+| `GET /`, `GET /health`, `POST /login`, `POST /usuarios` | 200/200/200/201 | igual | igual | igual |
+
+| Verificação da segunda execução | Resultado |
+|---|---|
+| Rotas registradas | ✅ 17 — as mesmas 17 |
+| Matriz de acesso | ✅ 17/17 rotas conferidas pela chamada; 13 exigem credencial, 4 públicas declaradas |
+| Rotas de negócio sem token | ✅ 13/13 respondem `401` |
+| Privilégio insuficiente | ✅ `403` em 8 rotas de admin com token de cliente; `403` em dono-ou-admin lendo terceiro |
+| Token adulterado / sem `Bearer` / vazio / expirado / assinado com outra chave | ✅ `401` nos cinco casos |
+| Contrato preservado sob credencial válida | ✅ **25/25** chamadas idênticas em status e corpo contra a versão sem gate rodando em paralelo |
+| Varredura por flag que desligue auth | ✅ 0 ocorrências |
+
+**Dado o token, as duas versões respondem exatamente a mesma coisa em 25/25 casos.**
+O gate mudou quem pode chamar, não o que a API responde a quem pode.
 
 ---
 
