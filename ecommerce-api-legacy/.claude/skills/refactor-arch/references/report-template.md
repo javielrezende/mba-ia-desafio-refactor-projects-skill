@@ -155,8 +155,26 @@ _(preenchido ao fim da Fase 3 — ver abaixo)_
 | Aplicação sobe sem erro | ✅ `flask run` — sem traceback |
 | Endpoints originais respondem | ✅ 16/16 endpoints, mesmo status e mesma forma de resposta |
 | Varredura final do catálogo | ✅ 0 anti-patterns CRITICAL/HIGH remanescentes |
+| Matriz de acesso | ✅ 16/16 rotas conferidas; 0 rota sensível anônima |
 
 <log real do boot e das chamadas — colar a saída, não parafrasear>
+
+### Matriz de acesso por rota
+
+Obrigatória sempre que a Fase 3 aplicou RP-17. **Uma linha por rota registrada**,
+nenhuma omitida — o total de linhas tem que bater com o total de rotas da
+aplicação. Status obtidos com a aplicação subida nos defaults versionados.
+
+| Rota | Classe | Anônimo | Cliente | Admin | Observação |
+|---|---|---|---|---|---|
+| `GET /health` | público | 200 | 200 | 200 | liveness probe, sem dado de negócio |
+| `POST /login` | público | 200 | — | — | emite o token |
+| `GET /produtos` | autenticado | **401** | 200 | 200 | |
+| `GET /usuarios/<id>` | dono ou admin | **401** | 200 (próprio) / **403** (outro) | 200 | |
+| `GET /relatorios/vendas` | privilegiado | **401** | **403** | 200 | faturamento da operação |
+
+Toda linha `público` precisa da justificativa na última coluna. Qualquer `200` na
+coluna *Anônimo* fora das linhas `público` significa Fase 3 incompleta.
 
 ### Breaking changes (correções de segurança)
 
@@ -175,4 +193,6 @@ _(preenchido ao fim da Fase 3 — ver abaixo)_
 - Ausência da linha/seção de APIs deprecated.
 - Marcar validação como ✅ sem ter executado o boot e as chamadas.
 - Marcar um finding de segurança como resolvido quando o controle existe mas está desligado nos defaults versionados — isso é finding **em aberto**, e a rota respondendo `200` sem credencial é a prova.
+- Marcar um finding de autenticação/autorização como resolvido enquanto **alguma** rota não pública responde sem credencial. Vale mesmo quando parte do finding foi tratada: hash forte aplicado, endpoint de SQL arbitrário removido e relatório de faturamento ainda anônimo = finding **em aberto**. O critério é o campo *Impacto* do próprio finding: toda frase escrita ali precisa ter deixado de ser verdade.
+- Seção "Resultado da Refatoração" sem a matriz de acesso, ou com matriz que cobre menos rotas do que a aplicação registra.
 - Inflar a contagem repetindo o mesmo achado em ocorrências separadas.

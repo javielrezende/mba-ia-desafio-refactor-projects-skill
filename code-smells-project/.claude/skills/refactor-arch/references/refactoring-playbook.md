@@ -1,6 +1,6 @@
 # Playbook de refatoração
 
-16 transformações, uma por família de anti-pattern. Cada uma traz o padrão **antes → depois** em Python e/ou JavaScript. Os exemplos são ilustrativos: aplique o *padrão*, adaptado à linguagem e às convenções do projeto detectado.
+17 transformações, uma por família de anti-pattern. Cada uma traz o padrão **antes → depois** em Python e/ou JavaScript. Os exemplos são ilustrativos: aplique o *padrão*, adaptado à linguagem e às convenções do projeto detectado.
 
 | Padrão | Resolve |
 |---|---|
@@ -20,6 +20,7 @@
 | RP-14 Migração de API deprecated | AP-15 |
 | RP-15 Renomeação e remoção de código morto | AP-18, AP-19 |
 | RP-16 Paginação | AP-12 |
+| RP-17 Gate de autenticação por rota | AP-04, AP-05 |
 
 ---
 
@@ -175,7 +176,7 @@ if (!password) throw new ValidationError('senha é obrigatória');   // nunca de
 const hash = await bcrypt.hash(password, 12);
 ```
 
-Junto: middleware de autenticação nas rotas de escrita e verificação de autorização de fato chamada (`is_admin()` que existe precisa ser usada).
+Junto: middleware de autenticação nas rotas de escrita e verificação de autorização de fato chamada (`is_admin()` que existe precisa ser usada). Hash forte protege a senha guardada; ele **não** fecha nenhuma rota. Fechar as rotas é **RP-17**, e as duas transformações andam sempre juntas — RP-04 sem RP-17 entrega um banco com senhas salgadas e uma API que continua respondendo a qualquer anônimo.
 
 ### Exigir o token é breaking change — e é para ser feito assim mesmo
 
@@ -278,6 +279,126 @@ def authenticate(email: str, raw_password: str) -> User:
 ```
 
 O `return 401` logo após `if not user:` é o anti-pattern: ele pula o cálculo do hash e responde mensuravelmente mais rápido do que o caminho da senha errada.
+
+---
+
+## RP-17 — Gate de autenticação por rota
+
+Complementa RP-04: aqui não se trata de *como* a credencial é guardada, e sim de
+*quais rotas exigem uma*. É a transformação que fecha a parte do AP-04 que o hash
+não resolve.
+
+**Gatilho:** existe rota que lê ou escreve dado de negócio sem credencial. Não
+importa se o projeto tem autenticação parcial, tem só um `/login` decorativo ou
+não tem nada — os três caem aqui.
+
+### Caso A — o projeto não tem mecanismo de autenticação nenhum
+
+O erro a evitar é concluir *"não havia autenticação, então não havia controle a
+consertar"*. É o contrário: ausência total de controle de acesso é a forma mais
+grave do finding. Um `/login` que confere a senha e devolve o usuário **não** é
+autenticação — nada do que ele devolve é apresentado nas chamadas seguintes, e
+nenhuma rota pede nada.
+
+**Antes** — o login "autentica" e a API inteira segue anônima:
+```python
+@app.route('/login', methods=['POST'])
+def login():
+    usuario = buscar_usuario(request.json['email'], request.json['senha'])
+    return jsonify({'dados': usuario, 'sucesso': True})     # nenhum token emitido
+
+@app.route('/relatorios/vendas')                            # faturamento público
+def relatorio_vendas():
+    return jsonify(calcular_vendas())
+```
+
+**Depois** — o login emite credencial e as rotas passam a exigi-la:
+```python
+# infrastructure/security.py — JWT HS256 com a stdlib, sem dependência nova
+class TokenSigner:
+    def __init__(self, secret, ttl_segundos):
+        self._secret, self._ttl = secret, ttl_segundos
+
+    def emitir(self, usuario_id, tipo): ...   # {'sub': id, 'tipo': tipo, 'exp': ...}
+    def decodificar(self, token): ...         # payload, ou None se assinatura/exp falham
+
+# middlewares/auth.py — sem flag: o guard vale sempre
+def exigir_autenticacao(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        _exigir_identidade()
+        return view(*args, **kwargs)
+    return wrapper
+
+def exigir_admin(view):
+    @wraps(view)
+    def wrapper(*args, **kwargs):
+        payload = _exigir_identidade()
+        if payload.get('tipo') != TipoUsuario.ADMIN.value:
+            raise PermissaoError('Requer privilégio de administrador')
+        return view(*args, **kwargs)
+    return wrapper
+
+# views/routes.py — o gate é aplicado no mapeamento da rota
+api.add_url_rule('/relatorios/vendas', 'relatorio_vendas',
+                 exigir_admin(relatorios.vendas), methods=['GET'])
+```
+```js
+// Express: o mesmo gate como middleware de rota
+router.get('/api/admin/financial-report', adminAuth, asyncHandler(reportController.financialReport));
+```
+
+O login passa a devolver o token, de forma aditiva ao corpo antigo:
+```python
+return jsonify({'dados': usuario, 'token': signer.emitir(usuario['id'], usuario['tipo']),
+                'sucesso': True, 'mensagem': 'Login OK'}), 200
+```
+
+### Caso B — existe controle, mas atrás de flag ou faltando em algumas rotas
+
+Ver a seção *"Exigir o token é breaking change"* em RP-04: o guard sai de dentro
+do `if settings.AUTH_REQUIRED` e a flag é apagada do config e do `.env.example`.
+
+### O inventário de rotas é a entrega desta transformação
+
+Liste **todas** as rotas registradas e classifique uma a uma. Deny-by-default: o
+padrão é `autenticado`, e cada exceção é escrita e justificada.
+
+| Rota | Classe | Por quê |
+|---|---|---|
+| `POST /login` | público | emite o token; exigir token aqui é impossível |
+| `POST /usuarios` (registro) | público | criar a primeira conta; papel privilegiado continua exigindo admin |
+| `GET /`, `GET /health` | público | liveness probe, sem dado de negócio |
+| `GET /produtos`, `GET /pedidos/usuario/<id>` | autenticado | dado de negócio |
+| `GET /usuarios`, `GET /pedidos`, `GET /relatorios/vendas` | privilegiado | dado agregado ou de terceiros |
+| `POST/PUT/DELETE /produtos`, `PUT /pedidos/<id>/status` | privilegiado | escrita no catálogo e no fluxo de pedido |
+
+Regras que não admitem exceção:
+
+- **Relatório, faturamento, métrica de negócio e listagem de usuários nunca são
+  públicos.** São exatamente o dado que o finding descreve como exposto.
+- **Rota que devolve ou altera dado de outro usuário** exige dono-ou-admin, não
+  só "autenticado": `GET /usuarios/<id>` com token de qualquer conta ainda é
+  vazamento.
+- **Remover o endpoint administrativo perigoso não fecha o finding.** Apagar
+  `/admin/query` e `/admin/reset-db` elimina *dois* vetores; as outras 15 rotas
+  continuam abertas até este gate existir.
+- **Nenhuma rota fica de fora do inventário.** Rota não listada é rota não
+  testada, e é sempre nela que o revisor encontra o `200` anônimo.
+
+### Prove com a chamada, nos defaults versionados
+
+```
+GET  /relatorios/vendas  sem token              401
+GET  /relatorios/vendas  token de cliente       403
+GET  /relatorios/vendas  token de admin         200
+GET  /produtos           sem token              401
+POST /login              sem token              200   (público, segue aberto)
+```
+
+Uma linha por rota, sem omissão. Se qualquer rota que você classificou como
+`autenticado` ou `privilegiado` responder `200` sem credencial, o finding
+correspondente **continua aberto** e a Fase 3 não terminou.
 
 ---
 
@@ -777,6 +898,7 @@ Se a resposta original era um array puro e o consumidor depende disso, mantenha 
 
 1. **RP-02** (config/segredos) — desbloqueia todo o resto e não quebra nada.
 2. **RP-01, RP-04** (segurança de dados) — CRITICAL, mudanças locais.
+   2b. **RP-17** (gate de autenticação) — aplicado logo depois de RP-04, sobre as rotas já mapeadas; nunca adiado para "uma próxima iteração".
 3. **RP-03, RP-06** (estrutura + injeção) — cria os diretórios e o composition root.
 4. **RP-05** (services) — move a regra para fora dos handlers.
 5. **RP-10, RP-11, RP-09** (erro, validação, transação) — transversais, aplicados sobre a estrutura nova.

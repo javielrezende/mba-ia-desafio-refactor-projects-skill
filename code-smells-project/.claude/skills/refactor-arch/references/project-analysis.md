@@ -141,6 +141,15 @@ Um módulo dentro de `services/`/`utils/` que **nenhum arquivo importa** é cama
 
 Mapeie também o **entry point** (`if __name__ == "__main__"`, `main` do `package.json`, `scripts.start`) e como as dependências são construídas: instanciadas dentro dos próprios módulos (acoplamento) ou injetadas de fora.
 
+**Superfície de autenticação — parte descritiva obrigatória do mapa.** Conte, ainda na Fase 1, quantas rotas o projeto registra e quantas passam por algum guard:
+
+```bash
+grep -rnE --exclude-dir={.claude,node_modules,.venv,__pycache__} "@[a-z_]*\.route\(|add_url_rule\(|(app|router)\.(get|post|put|delete|patch)\(" . | wc -l
+grep -rniE --exclude-dir={.claude,node_modules,.venv,__pycache__} "require_auth|exigir_auten|login_required|jwt_required|adminAuth|require_admin|authorization|before_request" . | wc -l
+```
+
+Registre o resultado como `Auth: <N de M rotas exigem credencial>`. `0 de 17` é um fato descritivo da arquitetura — igual a "sem camada de service" —, e é o número que a Fase 2 vai transformar em finding AP-04 e a Fase 3 em RP-17. Um `/login` que não emite credencial conta como **0**.
+
 ---
 
 ## 6. Formato de saída da Fase 1
@@ -158,6 +167,7 @@ Domain:        E-commerce API (produtos, pedidos, usuários)
 Architecture:  Monolítica — tudo em 4 arquivos, sem separação de camadas
 Source files:  4 files analyzed
 DB tables:     produtos, usuarios, pedidos, itens_pedido
+Auth:          0 de 17 rotas exigem credencial (login não emite token)
 ================================
 ```
 
@@ -167,4 +177,5 @@ Regras do bloco:
 - `Architecture` é uma frase com o padrão detectado + a evidência.
 - `Source files` bate com a contagem executada; acrescente `| ~N lines` quando útil.
 - `DB tables` lista os nomes reais. Se o banco for em memória sem tabelas, escreva `nenhuma (estado em memória)`.
+- `Auth` é obrigatória em qualquer projeto com rotas HTTP: `<N> de <M> rotas exigem credencial`, mais o mecanismo entre parênteses (`JWT`, `sessão`, `API key`, `login não emite token`, `nenhum`).
 - Acrescente a linha `Entry point:` quando ele não for óbvio.
